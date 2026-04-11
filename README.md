@@ -4,6 +4,14 @@ A Chrome extension for designers and frontend developers to capture and save des
 
 Extract colors, typography, and design tokens. Pick individual components. Reconstruct them with AI. Build a searchable library of visual inspiration.
 
+
+---
+
+## Demo Video
+
+[![Watch the video](https://img.youtube.com/vi/ehNkAae51sA/0.jpg)](https://www.youtube.com/watch?v=ehNkAae51sA)
+
+
 ---
 
 ## How to run
