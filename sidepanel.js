@@ -84,13 +84,28 @@ async function deleteSite(domain) {
 // SETTINGS
 // ─────────────────────────────────────────────
 
-async function getApiKey() {
-  const { apiKey = '' } = await chrome.storage.local.get('apiKey');
-  return apiKey;
+async function getClaudeApiKey() {
+  const { claudeApiKey = '', apiKey = '' } = await chrome.storage.local.get(['claudeApiKey', 'apiKey']);
+  return claudeApiKey || apiKey;
 }
 
-async function saveApiKey(key) {
-  await chrome.storage.local.set({ apiKey: key });
+async function getGeminiApiKey() {
+  const { geminiApiKey = '' } = await chrome.storage.local.get('geminiApiKey');
+  return geminiApiKey;
+}
+
+async function getAiProvider() {
+  const { aiProvider = 'claude' } = await chrome.storage.local.get('aiProvider');
+  return aiProvider;
+}
+
+async function saveSettings(claudeKey, geminiKey, provider) {
+  await chrome.storage.local.set({
+    claudeApiKey: claudeKey,
+    apiKey: claudeKey,
+    geminiApiKey: geminiKey,
+    aiProvider: provider
+  });
 }
 
 // ─────────────────────────────────────────────
@@ -146,7 +161,7 @@ function cropScreenshot(dataUrl, rect, devicePixelRatio = 1) {
 
 async function callClaude(systemPrompt, userContent, apiKey) {
   const body = {
-    model: 'claude-opus-4-6',
+    model: 'claude-3-5-haiku-latest',
     max_tokens: 4096,
     system: systemPrompt,
     messages: [{ role: 'user', content: userContent }]
@@ -172,7 +187,88 @@ async function callClaude(systemPrompt, userContent, apiKey) {
   return result.content[0]?.text || '';
 }
 
-async function reconstructComponent(component, screenshotDataUrl, apiKey) {
+async function getSupportedGeminiModel(apiKey) {
+  try {
+    const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      const models = data.models || [];
+      const geminiModels = models.filter(m => 
+        m.name.includes('gemini') && 
+        m.supportedGenerationMethods?.includes('generateContent')
+      );
+      
+      const preferred = ['gemini-1.5-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-2.5-pro', 'gemini-2.0-pro'];
+      for (const pref of preferred) {
+        const found = geminiModels.find(m => m.name.endsWith(pref));
+        if (found) return found.name.split('/').pop();
+      }
+      if (geminiModels.length > 0) {
+        return geminiModels[0].name.split('/').pop();
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to list Gemini models:', e);
+  }
+  return 'gemini-1.5-flash';
+}
+
+async function callGemini(systemPrompt, userContent, apiKey) {
+  let parts = [];
+  if (typeof userContent === 'string') {
+    parts.push({ text: userContent });
+  } else if (Array.isArray(userContent)) {
+    parts = userContent.map(item => {
+      if (item.type === 'text') {
+        return { text: item.text };
+      } else if (item.type === 'image') {
+        return {
+          inlineData: {
+            mimeType: item.source.media_type,
+            data: item.source.data
+          }
+        };
+      }
+      return null;
+    }).filter(Boolean);
+  }
+
+  const body = {
+    contents: [{ parts }],
+    systemInstruction: {
+      parts: [{ text: systemPrompt }]
+    }
+  };
+
+  const model = await getSupportedGeminiModel(apiKey);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error?.message || `Gemini API error ${resp.status}`);
+  }
+
+  const result = await resp.json();
+  return result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+async function callLLM(systemPrompt, userContent, apiKey, provider) {
+  if (provider === 'gemini') {
+    return callGemini(systemPrompt, userContent, apiKey);
+  } else {
+    return callClaude(systemPrompt, userContent, apiKey);
+  }
+}
+
+async function reconstructComponent(component, screenshotDataUrl, apiKey, provider) {
   const content = [
     {
       type: 'text',
@@ -216,10 +312,10 @@ Please produce a single self-contained HTML file that:
 You produce clean, self-contained HTML files that faithfully replicate UI components.
 Always output only valid HTML — no explanation text, no markdown code fences.`;
 
-  return callClaude(systemPrompt, content, apiKey);
+  return callLLM(systemPrompt, content, apiKey, provider);
 }
 
-async function generateTags(stylesData, apiKey) {
+async function generateTags(stylesData, apiKey, provider) {
   const { colors, typography, domain } = stylesData;
 
   const colorHexes = (colors?.smart || []).map(c => c.hex).join(', ');
@@ -244,7 +340,7 @@ Return ONLY a JSON object with these exact keys (no explanation, no markdown):
 
 Each array should have 1-3 tags maximum. Only include tags you're confident about.`;
 
-  const raw = await callClaude('You are a design analyst. Respond only with valid JSON.', prompt, apiKey);
+  const raw = await callLLM('You are a design analyst. Respond only with valid JSON.', prompt, apiKey, provider);
   // Extract JSON from response
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('No JSON in response');
@@ -585,9 +681,11 @@ async function reconstructCurrentComponent() {
   errorEl.style.display = 'none';
   resultEl.style.display = 'none';
 
-  const apiKey = await getApiKey();
+  const provider = await getAiProvider();
+  const apiKey = provider === 'gemini' ? await getGeminiApiKey() : await getClaudeApiKey();
   if (!apiKey) {
-    errorEl.textContent = 'No API key found — add your Claude API key in Settings ⚙';
+    const providerName = provider === 'gemini' ? 'Gemini' : 'Claude';
+    errorEl.textContent = `No API key found — add your ${providerName} API key in Settings ⚙`;
     errorEl.style.display = 'block';
     return;
   }
@@ -597,7 +695,7 @@ async function reconstructCurrentComponent() {
   btn.innerHTML = '<span class="spinner"></span> Reconstructing…';
 
   try {
-    const reconstructed = await reconstructComponent(pendingComponent, pendingScreenshot, apiKey);
+    const reconstructed = await reconstructComponent(pendingComponent, pendingScreenshot, apiKey, provider);
 
     // Wire up result-panel buttons with the fresh HTML
     document.getElementById('btn-copy-reconstructed').onclick = () => copyText(reconstructed);
@@ -977,10 +1075,12 @@ function buildSiteCard(domain, siteData, screenshotMap, components, query) {
 
   genBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
-    const apiKey = await getApiKey();
+    const provider = await getAiProvider();
+    const apiKey = provider === 'gemini' ? await getGeminiApiKey() : await getClaudeApiKey();
     if (!apiKey) {
+      const providerName = provider === 'gemini' ? 'Gemini' : 'Claude';
       genStatus.style.color = 'var(--danger)';
-      genStatus.textContent = 'API key not found — add one in Settings';
+      genStatus.textContent = `API key not found — add your ${providerName} key in Settings`;
       return;
     }
 
@@ -1003,10 +1103,11 @@ Notes: "${notesText}"
 Return ONLY a JSON array of short lowercase tag strings (max 8 tags). Examples: ["bento-grid","rounded","minimal","apple-inspired","pastel"]
 No explanation, no markdown.`;
 
-      const raw = await callClaude(
+      const raw = await callLLM(
         'You are a design analyst. Respond only with a valid JSON array of strings.',
         prompt,
-        apiKey
+        apiKey,
+        provider
       );
 
       const match = raw.match(/\[[\s\S]*?\]/);
@@ -1097,16 +1198,18 @@ async function renderMoodboard(query = '') {
       // Kick off AI tag generation in background if needed
       const siteData = sites[domain];
       if (!siteData.aiTags && siteData.styles) {
-        getApiKey().then(apiKey => {
-          if (apiKey) generateTagsForSite(domain, siteData, apiKey);
-        });
+        (async () => {
+          const provider = await getAiProvider();
+          const apiKey = provider === 'gemini' ? await getGeminiApiKey() : await getClaudeApiKey();
+          if (apiKey) generateTagsForSite(domain, siteData, apiKey, provider);
+        })();
       }
     });
 }
 
-async function generateTagsForSite(domain, siteData, apiKey) {
+async function generateTagsForSite(domain, siteData, apiKey, provider) {
   try {
-    const aiTags = await generateTags(siteData.styles, apiKey);
+    const aiTags = await generateTags(siteData.styles, apiKey, provider);
     await saveSiteData(domain, { aiTags });
     // Refresh the specific card's tags without full re-render
     renderMoodboard(document.getElementById('mb-search')?.value || '');
@@ -1193,8 +1296,12 @@ async function getCurrentTabId() {
 
 async function openSettings() {
   document.getElementById('settings-panel').style.display = 'flex';
-  const apiKey = await getApiKey();
-  document.getElementById('input-api-key').value = apiKey;
+  const claudeKey = await getClaudeApiKey();
+  const geminiKey = await getGeminiApiKey();
+  const provider = await getAiProvider();
+  document.getElementById('input-claude-key').value = claudeKey;
+  document.getElementById('input-gemini-key').value = geminiKey;
+  document.getElementById('select-ai-provider').value = provider;
   await renderSavedSitesList();
 }
 
@@ -1321,8 +1428,10 @@ function wireEvents() {
   document.getElementById('btn-close-settings').addEventListener('click', closeSettings);
 
   document.getElementById('btn-save-settings').addEventListener('click', async () => {
-    const key = document.getElementById('input-api-key').value.trim();
-    await saveApiKey(key);
+    const claudeKey = document.getElementById('input-claude-key').value.trim();
+    const geminiKey = document.getElementById('input-gemini-key').value.trim();
+    const provider = document.getElementById('select-ai-provider').value;
+    await saveSettings(claudeKey, geminiKey, provider);
     toast('Settings saved');
     closeSettings();
   });

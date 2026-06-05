@@ -187,11 +187,23 @@
       <button class="icon-btn" id="btn-close-settings">✕</button>
     </div>
     <div class="settings-body">
+      <label class="settings-label">AI Provider</label>
+      <select class="settings-input" id="select-ai-provider" style="margin-bottom: 12px; font-family: inherit;">
+        <option value="claude">Claude (Anthropic)</option>
+        <option value="gemini">Gemini (Google)</option>
+      </select>
+
       <label class="settings-label">Claude API Key
-        <span class="settings-hint">Used to reconstruct components and generate tags</span>
+        <span class="settings-hint">Used when provider is Claude</span>
       </label>
-      <input type="password" class="settings-input" id="input-api-key" placeholder="sk-ant-…" />
-      <button class="btn-primary" id="btn-save-settings" style="width:100%; margin-top:8px">Save</button>
+      <input type="password" class="settings-input" id="input-claude-key" placeholder="sk-ant-…" style="margin-bottom: 12px;" />
+
+      <label class="settings-label">Gemini API Key
+        <span class="settings-hint">Used when provider is Gemini</span>
+      </label>
+      <input type="password" class="settings-input" id="input-gemini-key" placeholder="AIzaSy…" />
+
+      <button class="btn-primary" id="btn-save-settings" style="width:100%; margin-top:12px">Save</button>
 
       <div class="settings-divider"></div>
 
