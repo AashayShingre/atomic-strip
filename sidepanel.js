@@ -193,12 +193,19 @@ async function getSupportedGeminiModel(apiKey) {
     if (resp.ok) {
       const data = await resp.json();
       const models = data.models || [];
-      const geminiModels = models.filter(m => 
-        m.name.includes('gemini') && 
+      const geminiModels = models.filter(m =>
+        m.name.includes('gemini') &&
         m.supportedGenerationMethods?.includes('generateContent')
       );
-      
-      const preferred = ['gemini-1.5-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-2.5-pro', 'gemini-2.0-pro'];
+
+      const preferred = [
+        'gemini-3.1-flash-lite',
+        'gemini-2.5-flash-lite',
+        'gemini-3.5-flash',
+        'gemini-3-flash',
+        'gemini-2.5-flash',
+        'gemini-1.5-flash'
+      ];
       for (const pref of preferred) {
         const found = geminiModels.find(m => m.name.endsWith(pref));
         if (found) return found.name.split('/').pop();
@@ -272,29 +279,26 @@ async function reconstructComponent(component, screenshotDataUrl, apiKey, provid
   const content = [
     {
       type: 'text',
-      text: `Here is a UI component captured from ${component.domain}.
+      text: `Reconstruct this UI component captured from ${component.domain}.
 
-**Element tag:** ${component.tag}
-**Category:** ${component.category}
-**Fonts used:** ${component.fontFamilies?.join(', ') || 'unknown'}
+**Component Category:** ${component.category}
+**Tag Name:** ${component.tag}
+**Fonts:** ${component.fontFamilies?.join(', ') || 'unknown'}
 
-**HTML:**
+**Original HTML:**
 \`\`\`html
 ${component.html}
 \`\`\`
 
-**Relevant CSS (filtered from the page):**
+**Original CSS (Computed and Rules):**
 \`\`\`css
 ${component.css}
 \`\`\`
 
-Please produce a single self-contained HTML file that:
-1. Replicates this component's visual appearance as closely as possible
-2. Uses a minimal, clean <style> block (inline critical CSS, remove duplicates)
-3. Resolves all CSS variable references with their actual values (already provided in the CSS)
-4. Infers and implements the expected interactions (hover states, click toggles, dropdowns, etc.) using vanilla JS
-5. Uses Google Fonts @import if specific fonts are referenced
-6. Outputs ONLY the HTML file — no explanation, no markdown fences`
+Provide a single self-contained HTML file. Ensure:
+- The design matches the HTML/CSS and the screenshot (if provided) exactly.
+- Common interactive behaviors (such as tooltips, dropdowns, accordions, toggles) are fully functional and visually refined.
+- Output ONLY the raw HTML code. Do NOT wrap the response in markdown code blocks (\`\`\`), and provide no extra explanation.`
     }
   ];
 
@@ -308,9 +312,24 @@ Please produce a single self-contained HTML file that:
     content.unshift({ type: 'text', text: 'Here is a screenshot of the component for visual reference:' });
   }
 
-  const systemPrompt = `You are an expert frontend developer specializing in extracting and reconstructing UI components.
-You produce clean, self-contained HTML files that faithfully replicate UI components.
-Always output only valid HTML — no explanation text, no markdown code fences.`;
+  const systemPrompt = `You are a world-class senior frontend engineer and UI designer specializing in component reconstruction.
+Your goal is to produce a single, production-grade, self-contained HTML file that replicates the visual design and interactive behaviors of the captured UI component with extreme fidelity.
+
+Follow these strict design and coding principles:
+1. VISUAL FIDELITY & POLISH: Replicate colors, spacing, alignment, typography, border-radii, borders, and shadows exactly. Ensure it looks premium, clean, and modern.
+2. INTERACTIVE STATES: Implement all interactive states:
+   - Hover effects (scale, opacity, color shifts, transitions).
+   - Focus rings for accessibility.
+   - Active/click press feedback.
+3. COMMON INTERACTION INFERENCE:
+   - Tooltips: Look for attributes like 'title', 'data-tooltip', 'aria-label', 'aria-describedby', or placeholder classes. Construct a clean, animated tooltip positioned correctly relative to the target, visible on hover/focus.
+   - Dropdowns & Popovers: If you see indicators like chevrons (▾), 'aria-haspopup', 'aria-expanded', or menu items, implement a fully interactive dropdown toggle with smooth opening/closing transitions.
+   - Accordions & Tabs: Implement tab switching or accordion collapse/expand with smooth height transitions and ARIA attributes.
+   - Modals & Dialogs: Implement open/close buttons, overlay backdrops, and disable background scroll when open.
+4. VANILLA JAVASCRIPT: Write clean, modern, self-contained vanilla ES6+ JavaScript within a <script> tag. Ensure all interaction handlers are robust, prevent default actions where necessary, and support keyboard navigation (e.g., Close on 'Escape').
+5. COMPACT CSS: Include a clean <style> block inside the <head>. Resolve duplicate rules, tidy up selectors, and use modern transitions for animations.
+6. ASSETS & FONTS: Use relative placeholder URLs for missing images. If external fonts are mentioned, import them using Google Fonts @import.
+7. Always output only valid HTML — no explanation text, no markdown code fences.`;
 
   return callLLM(systemPrompt, content, apiKey, provider);
 }
@@ -1282,7 +1301,7 @@ async function updateSiteContext(tabId) {
       // Same domain, just update the tracked tab id
       currentTabId = tabId;
     }
-  } catch {}
+  } catch { }
 }
 
 async function getCurrentTabId() {
@@ -1455,14 +1474,14 @@ function wireEvents() {
 
     if (btn.classList.contains('active')) {
       // Cancel picker
-      await sendToTab(currentTabId, { type: 'STOP_PICKER' }).catch(() => {});
+      await sendToTab(currentTabId, { type: 'STOP_PICKER' }).catch(() => { });
       btn.classList.remove('active');
       btn.innerHTML = `
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1l4 10 2-4 4-2L1 1z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><line x1="7" y1="7" x2="13" y2="13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
         Pick Component`;
       status.textContent = '';
     } else {
-      await sendToTab(currentTabId, { type: 'START_PICKER' }).catch(() => {});
+      await sendToTab(currentTabId, { type: 'START_PICKER' }).catch(() => { });
       btn.classList.add('active');
       btn.textContent = 'Cancel';
       status.textContent = 'Hover over an element and click…';
