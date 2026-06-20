@@ -99,6 +99,18 @@ async function getAiProvider() {
   return aiProvider;
 }
 
+// Reconstruction effort → how many generate/verify passes the agent may use.
+const EFFORT_TRIES = { low: 1, medium: 3, high: 5 };
+
+async function getReconEffort() {
+  const { reconEffort = 'medium' } = await chrome.storage.local.get('reconEffort');
+  return EFFORT_TRIES[reconEffort] ? reconEffort : 'medium';
+}
+
+async function saveReconEffort(effort) {
+  await chrome.storage.local.set({ reconEffort: effort });
+}
+
 async function saveSettings(claudeKey, geminiKey, provider) {
   await chrome.storage.local.set({
     claudeApiKey: claudeKey,
@@ -275,84 +287,25 @@ async function callLLM(systemPrompt, userContent, apiKey, provider) {
   }
 }
 
-// ─────────────────────────────────────────────
-// INTERACTION PLANNER (LLM "decide" step for the hybrid agentic probe)
-// content.js asks (PROBE_PLAN) which elements to interact with; we let the LLM
-// choose, returning a compact action list. content.js executes deterministically.
-// ─────────────────────────────────────────────
+const RECONSTRUCT_SYSTEM_PROMPT = `You are a world-class senior frontend engineer and UI designer specializing in component reconstruction.
+Your goal is to produce a single, production-grade, self-contained HTML file that replicates the visual design and interactive behaviors of the captured UI component with extreme fidelity.
 
-function parsePlanArray(raw) {
-  if (!raw) return [];
-  const match = raw.match(/\[[\s\S]*\]/);
-  if (!match) return [];
-  let arr;
-  try { arr = JSON.parse(match[0]); } catch { return []; }
-  if (!Array.isArray(arr)) return [];
-  const allowed = new Set(['hover', 'focus', 'click']);
-  return arr
-    .filter((a) => a && Number.isInteger(a.index))
-    .map((a) => ({ index: a.index, action: allowed.has(a.action) ? a.action : 'hover', reason: a.reason || '' }))
-    .slice(0, 5);
-}
-
-async function planInitialInteractions(message, apiKey, provider) {
-  const candList = (message.candidates || [])
-    .map((c) => `${c.index}: <${c.tag}> "${c.text}" ${(c.attrs || []).join(' ')} [${c.selector}]`)
-    .join('\n');
-
-  const content = [];
-  if (message.screenshot) {
-    const b64 = message.screenshot.split(',')[1];
-    if (b64) {
-      content.push({ type: 'text', text: 'Resting-state screenshot of the component:' });
-      content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: b64 } });
-    }
-  }
-  content.push({
-    type: 'text',
-    text: `HTML:\n\`\`\`html\n${message.html || ''}\n\`\`\`\n\nCSS:\n\`\`\`css\n${message.css || ''}\n\`\`\`\n\nCandidate interactive elements (index: <tag> "text" attrs [selector]):\n${candList}\n\nReturn ONLY the JSON array.`,
-  });
-
-  const systemPrompt = `You are a UI interaction planner for a design-capture tool.
-You are given a captured UI component's HTML, CSS, a resting-state screenshot, and a numbered list of candidate interactive elements.
-Decide which candidates are worth interacting with to reveal hidden or dynamic UI (dropdown menus, tooltips, popovers, submenus, toggled content, injected badges).
-- SKIP elements unlikely to reveal anything new (plain navigation links, decorative icons, static text).
-- For each chosen candidate pick the single action most likely to reveal new UI: "hover", "focus", or "click". Use "click" ONLY for elements that clearly toggle/open content (menus, disclosure buttons) — never for links that navigate to another page.
-Return ONLY a JSON array, max 5 items, ordered by importance:
-[{"index": <number>, "action": "hover"|"focus"|"click", "reason": "<short>"}]
-If nothing is worth probing, return [].`;
-
-  const raw = await callLLM(systemPrompt, content, apiKey, provider);
-  return parsePlanArray(raw);
-}
-
-async function planReplanInteractions(message, apiKey, provider) {
-  const candList = (message.candidates || [])
-    .map((c) => `${c.index}: <${c.tag}> "${c.text}" ${(c.attrs || []).join(' ')} [${c.selector}]`)
-    .join('\n');
-  const history = (message.history || [])
-    .map((h) => `- ${h.trigger}${h.added && h.added.length ? ` revealed: ${h.added.join(', ')}` : ''}`)
-    .join('\n');
-
-  const systemPrompt = `You are a UI interaction planner exploring nested UI.
-The element \`${message.parent || 'a trigger'}\` was activated and revealed new interactive elements (listed below).
-Choose up to 2 follow-up actions to reveal DEEPER nested UI (e.g. a submenu/flyout inside the opened menu, a tooltip on a revealed item).
-Only pick elements likely to reveal something further; otherwise return [].
-Return ONLY a JSON array referring to the NEW candidate list:
-[{"index": <number>, "action": "hover"|"focus"|"click", "reason": "<short>"}]`;
-
-  const userText = `Actions already performed:\n${history || '(none)'}\n\nNewly revealed interactive elements (index: <tag> "text" attrs [selector]):\n${candList}\n\nReturn ONLY the JSON array.`;
-  const raw = await callLLM(systemPrompt, userText, apiKey, provider);
-  return parsePlanArray(raw).slice(0, 2);
-}
-
-async function computeProbePlan(message) {
-  const provider = await getAiProvider();
-  const apiKey = provider === 'gemini' ? await getGeminiApiKey() : await getClaudeApiKey();
-  if (!apiKey) return null; // no key → content.js falls back to the heuristic sweep
-  if (message.phase === 'replan') return planReplanInteractions(message, apiKey, provider);
-  return planInitialInteractions(message, apiKey, provider);
-}
+Follow these strict design and coding principles:
+1. VISUAL FIDELITY & POLISH: Replicate colors, spacing, alignment, typography, border-radii, borders, and shadows exactly. Ensure it looks premium, clean, and modern.
+2. INTERACTIVE STATES: Implement all interactive states:
+   - Hover effects (scale, opacity, color shifts, transitions).
+   - Focus rings for accessibility.
+   - Active/click press feedback.
+3. OBSERVED INTERACTION STATES (HIGHEST PRIORITY): If the prompt includes "Observed interaction states", these were captured live by hovering the component and are GROUND TRUTH. Reproduce each one exactly — implement the dropdown/tooltip/popover/badge that appears, wired to the same trigger, with matching content and styling from the accompanying state screenshots. The revealed markup may have been absent from the original HTML (rendered dynamically); recreate it regardless.
+4. COMMON INTERACTION INFERENCE (when not directly observed above):
+   - Tooltips: Look for attributes like 'title', 'data-tooltip', 'aria-label', 'aria-describedby', or placeholder classes. Construct a clean, animated tooltip positioned correctly relative to the target, visible on hover/focus.
+   - Dropdowns & Popovers: If you see indicators like chevrons (▾), 'aria-haspopup', 'aria-expanded', or menu items, implement a fully interactive dropdown toggle with smooth opening/closing transitions.
+   - Accordions & Tabs: Implement tab switching or accordion collapse/expand with smooth height transitions and ARIA attributes.
+   - Modals & Dialogs: Implement open/close buttons, overlay backdrops, and disable background scroll when open.
+4. VANILLA JAVASCRIPT: Write clean, modern, self-contained vanilla ES6+ JavaScript within a <script> tag. Ensure all interaction handlers are robust, prevent default actions where necessary, and support keyboard navigation (e.g., Close on 'Escape').
+5. COMPACT CSS: Include a clean <style> block inside the <head>. Resolve duplicate rules, tidy up selectors, and use modern transitions for animations.
+6. ASSETS & FONTS: Use relative placeholder URLs for missing images. If external fonts are mentioned, import them using Google Fonts @import.
+7. Always output only valid HTML — no explanation text, no markdown code fences.`;
 
 function buildInteractionSpec(interactions) {
   if (!interactions || !interactions.length) return '';
@@ -424,27 +377,279 @@ Provide a single self-contained HTML file. Ensure:
     content.unshift({ type: 'text', text: 'Here is a screenshot of the component in its resting state:' });
   }
 
-  const systemPrompt = `You are a world-class senior frontend engineer and UI designer specializing in component reconstruction.
-Your goal is to produce a single, production-grade, self-contained HTML file that replicates the visual design and interactive behaviors of the captured UI component with extreme fidelity.
+  return callLLM(RECONSTRUCT_SYSTEM_PROMPT, content, apiKey, provider);
+}
 
-Follow these strict design and coding principles:
-1. VISUAL FIDELITY & POLISH: Replicate colors, spacing, alignment, typography, border-radii, borders, and shadows exactly. Ensure it looks premium, clean, and modern.
-2. INTERACTIVE STATES: Implement all interactive states:
-   - Hover effects (scale, opacity, color shifts, transitions).
-   - Focus rings for accessibility.
-   - Active/click press feedback.
-3. OBSERVED INTERACTION STATES (HIGHEST PRIORITY): If the prompt includes "Observed interaction states", these were captured live by hovering the component and are GROUND TRUTH. Reproduce each one exactly — implement the dropdown/tooltip/popover/badge that appears, wired to the same trigger, with matching content and styling from the accompanying state screenshots. The revealed markup may have been absent from the original HTML (rendered dynamically); recreate it regardless.
-4. COMMON INTERACTION INFERENCE (when not directly observed above):
-   - Tooltips: Look for attributes like 'title', 'data-tooltip', 'aria-label', 'aria-describedby', or placeholder classes. Construct a clean, animated tooltip positioned correctly relative to the target, visible on hover/focus.
-   - Dropdowns & Popovers: If you see indicators like chevrons (▾), 'aria-haspopup', 'aria-expanded', or menu items, implement a fully interactive dropdown toggle with smooth opening/closing transitions.
-   - Accordions & Tabs: Implement tab switching or accordion collapse/expand with smooth height transitions and ARIA attributes.
-   - Modals & Dialogs: Implement open/close buttons, overlay backdrops, and disable background scroll when open.
-4. VANILLA JAVASCRIPT: Write clean, modern, self-contained vanilla ES6+ JavaScript within a <script> tag. Ensure all interaction handlers are robust, prevent default actions where necessary, and support keyboard navigation (e.g., Close on 'Escape').
-5. COMPACT CSS: Include a clean <style> block inside the <head>. Resolve duplicate rules, tidy up selectors, and use modern transitions for animations.
-6. ASSETS & FONTS: Use relative placeholder URLs for missing images. If external fonts are mentioned, import them using Google Fonts @import.
-7. Always output only valid HTML — no explanation text, no markdown code fences.`;
+// ─────────────────────────────────────────────
+// AGENTIC RECONSTRUCTION (generate → render → critique → revise loop)
+// The model's output is rendered in an isolated offscreen iframe, rasterized
+// with html2canvas, and visually compared against the original screenshot.
+// The model then self-corrects until the render matches or the budget runs out.
+// ─────────────────────────────────────────────
 
-  return callLLM(systemPrompt, content, apiKey, provider);
+const RENDER_WIDTH = 1024;       // viewport width used to render the reconstruction
+const RENDER_MAX_HEIGHT = 2400;  // clamp very tall renders
+const MAX_VERIFY_ITERS = 3;      // hard cap on critique→revise rounds
+
+function stripCodeFences(s = '') {
+  return String(s).replace(/^\s*```(?:html)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+}
+
+function ensureFullDoc(html) {
+  const t = (html || '').trim();
+  if (/^<!doctype/i.test(t) || /^<html[\s>]/i.test(t)) return html;
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${html}</body></html>`;
+}
+
+function escapeHtml(s = '') {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// Render a full HTML document string in an isolated offscreen iframe and
+// rasterize it to a PNG dataUrl. Inline <script> does NOT execute (extension
+// CSP), so this captures the RESTING visual state — which is what we verify.
+// Returns null on failure.
+function renderHtmlToImage(html, { width = RENDER_WIDTH, settleMs = 450 } = {}) {
+  return new Promise((resolve) => {
+    const harness = document.getElementById('render-harness');
+    if (!harness || typeof html2canvas !== 'function') return resolve(null);
+
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('aria-hidden', 'true');
+    // Offscreen but fully laid out (display:none would prevent rendering).
+    iframe.style.cssText = `position:fixed; left:-99999px; top:0; width:${width}px; height:800px; border:0; background:#fff;`;
+    harness.appendChild(iframe);
+
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      try { iframe.remove(); } catch {}
+      resolve(val);
+    };
+    const timeout = setTimeout(() => finish(null), 15000);
+
+    iframe.onload = async () => {
+      try {
+        const doc = iframe.contentDocument;
+        if (!doc || !doc.body) return finish(null);
+        try { await doc.fonts?.ready; } catch {}
+        await new Promise((r) => setTimeout(r, settleMs));
+
+        const fullHeight = Math.min(
+          RENDER_MAX_HEIGHT,
+          Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight, 1)
+        );
+        iframe.style.height = `${fullHeight}px`;
+        await new Promise((r) => setTimeout(r, 60));
+
+        const canvas = await html2canvas(doc.body, {
+          backgroundColor: '#ffffff',
+          width,
+          height: fullHeight,
+          windowWidth: width,
+          windowHeight: fullHeight,
+          scale: 1,
+          logging: false,
+          useCORS: true,
+        });
+        clearTimeout(timeout);
+        finish(canvas.toDataURL('image/png'));
+      } catch (err) {
+        console.warn('[atomic-strip] render failed:', err);
+        clearTimeout(timeout);
+        finish(null);
+      }
+    };
+
+    iframe.srcdoc = ensureFullDoc(html);
+  });
+}
+
+// Ask the model to visually compare its render against the original AND flag
+// interactive affordances whose behavior hasn't been captured yet (so the agent
+// can re-probe them on the live page). Returns { verdict, score, issues, missingInteractions }.
+async function critiqueReconstruction(referenceShot, renderShot, component, apiKey, provider, interactions = []) {
+  const captured = (interactions || []).map((s) => s.trigger).filter(Boolean);
+  const capturedList = captured.length
+    ? captured.map((t) => `- ${t}`).join('\n')
+    : '- (none captured yet)';
+
+  const content = [{
+    type: 'text',
+    text: `You are reviewing an AI-generated reconstruction of a UI component from ${component.domain}.
+
+IMAGE 1 = TARGET: a screenshot of the ORIGINAL component (ground truth).
+IMAGE 2 = CURRENT RENDER: how the generated HTML/CSS actually renders right now (resting state, JavaScript disabled).
+
+PART A — Resting visual fidelity. Compare IMAGE 2 against IMAGE 1:
+- layout, alignment, proportions, spacing/padding
+- colors (background, text, borders), gradients, shadows
+- typography (family vibe, size, weight, casing, letter-spacing)
+- border-radius, borders, dividers
+- text content and icons that should be visible at rest
+IGNORE anything that needs interaction/JS to appear (open dropdowns, tooltips, popovers, modals) — JS is disabled in IMAGE 2, so their absence is EXPECTED and must NOT be a resting issue.
+
+PART B — Interaction coverage. The following interaction states were already captured live from the original (by hovering/focusing it):
+${capturedList}
+
+Original component HTML:
+\`\`\`html
+${(component.html || '').slice(0, 4000)}
+\`\`\`
+
+Looking at IMAGE 1 and the HTML, identify interactive affordances (menu/dropdown triggers, items with chevrons, avatars, "more"/kebab buttons, tabs, tooltips via title/aria, etc.) whose revealed behavior is NOT in the captured list above and would help reconstruct the component faithfully. For each, give a CSS selector valid against the original HTML and the action to try. Omit anything already captured. Return at most 4.
+
+Respond with ONLY a JSON object (no markdown, no commentary):
+{
+  "verdict": "pass" | "revise",
+  "score": <integer 0-100, resting-state visual similarity>,
+  "issues": ["short, specific, actionable resting-state discrepancies — most impactful first"],
+  "missingInteractions": [{ "selector": "css selector", "action": "hover" | "click" | "focus", "why": "short reason" }]
+}
+Use "pass" when the resting render faithfully matches (score >= 85) with no significant discrepancies. "missingInteractions" may be empty.`
+  }];
+
+  const refB64 = referenceShot?.split(',')[1];
+  const renB64 = renderShot?.split(',')[1];
+  if (refB64) {
+    content.push({ type: 'text', text: 'IMAGE 1 — TARGET (original):' });
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: refB64 } });
+  }
+  if (renB64) {
+    content.push({ type: 'text', text: 'IMAGE 2 — CURRENT RENDER (your generated code):' });
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: renB64 } });
+  }
+
+  const raw = await callLLM('You are a meticulous UI QA reviewer. Respond only with valid JSON.', content, apiKey, provider);
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (!m) return { verdict: 'pass', score: null, issues: [], missingInteractions: [] };
+  try {
+    const parsed = JSON.parse(m[0]);
+    const probes = Array.isArray(parsed.missingInteractions) ? parsed.missingInteractions : [];
+    return {
+      verdict: parsed.verdict === 'revise' ? 'revise' : 'pass',
+      score: typeof parsed.score === 'number' ? parsed.score : null,
+      issues: Array.isArray(parsed.issues) ? parsed.issues.filter(Boolean).map(String) : [],
+      missingInteractions: probes
+        .filter((p) => p && p.selector)
+        .slice(0, 4)
+        .map((p) => ({ selector: String(p.selector), action: ['hover', 'click', 'focus'].includes(p.action) ? p.action : 'hover', why: p.why ? String(p.why) : '' })),
+    };
+  } catch {
+    return { verdict: 'pass', score: null, issues: [], missingInteractions: [] };
+  }
+}
+
+// Ask the model to fix the listed discrepancies, given its current HTML plus
+// the target and its own render. Returns revised HTML.
+async function reviseReconstruction(component, currentHtml, issues, referenceShot, renderShot, apiKey, provider, interactions = []) {
+  const interactionSpec = buildInteractionSpec(interactions);
+  const content = [{
+    type: 'text',
+    text: `You previously generated an HTML reconstruction of a UI component from ${component.domain}. A visual QA pass compared your render to the original and found discrepancies.
+
+**Discrepancies to fix (highest priority — address every one):**
+${issues.length ? issues.map((s, i) => `${i + 1}. ${s}`).join('\n') : '- (none specified — make a closer visual match)'}
+
+IMAGE 1 = TARGET (the original you must match). IMAGE 2 = how YOUR current code renders. Adjust the code so IMAGE 2 matches IMAGE 1.
+
+**Your current HTML (revise it — keep what already matches, fix the listed issues):**
+\`\`\`html
+${currentHtml}
+\`\`\`
+${interactionSpec}
+
+Return the FULL corrected, self-contained HTML file. Preserve all working interactive behaviors and observed interaction states. Output ONLY raw HTML — no markdown fences, no commentary.`
+  }];
+
+  const refB64 = referenceShot?.split(',')[1];
+  const renB64 = renderShot?.split(',')[1];
+  if (refB64) {
+    content.push({ type: 'text', text: 'IMAGE 1 — TARGET (original):' });
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: refB64 } });
+  }
+  if (renB64) {
+    content.push({ type: 'text', text: 'IMAGE 2 — your current render:' });
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: renB64 } });
+  }
+
+  const raw = await callLLM(RECONSTRUCT_SYSTEM_PROMPT, content, apiKey, provider);
+  return stripCodeFences(raw);
+}
+
+// Merge freshly re-probed states into the existing set, de-duped by trigger.
+function mergeInteractionStates(existing, added) {
+  const out = existing.slice();
+  const seen = new Set(existing.map((s) => s.trigger));
+  for (const s of (added || [])) {
+    if (out.length >= 12) break;
+    if (s && s.screenshot && !seen.has(s.trigger)) {
+      out.push(s);
+      seen.add(s.trigger);
+    }
+  }
+  return out;
+}
+
+// The full agent loop. onProgress(phase, data) drives the UI.
+// opts: { maxIters, reprobeTargets } — reprobeTargets(targets) → Promise<states[]>.
+async function agenticReconstruct(component, screenshot, apiKey, provider, interactions, onProgress = () => {}, opts = {}) {
+  const maxIters = opts.maxIters || MAX_VERIFY_ITERS;
+  const reprobeTargets = opts.reprobeTargets || null;
+  let states = Array.isArray(interactions) ? interactions.slice() : [];
+  const requestedSelectors = new Set(); // avoid re-probing the same trigger
+
+  onProgress({ phase: 'generate' });
+  let html = stripCodeFences(await reconstructComponent(component, screenshot, apiKey, provider, states));
+
+  // Without a reference screenshot there's nothing to verify against.
+  if (!screenshot) {
+    onProgress({ phase: 'no-reference' });
+    return { html, render: null, interactions: states };
+  }
+
+  let lastRender = null;
+  for (let i = 1; i <= maxIters; i++) {
+    onProgress({ phase: 'render', iteration: i });
+    const render = await renderHtmlToImage(html);
+    if (!render) {
+      onProgress({ phase: 'render-skip', iteration: i });
+      break;
+    }
+    lastRender = render;
+
+    onProgress({ phase: 'critique', iteration: i });
+    const review = await critiqueReconstruction(screenshot, render, component, apiKey, provider, states);
+    onProgress({ phase: 'verdict', iteration: i, review, render, reference: screenshot });
+
+    const restingOk = review.verdict === 'pass' || !review.issues.length;
+    if (restingOk && !review.missingInteractions.length) break; // good enough — close the loop
+    if (i === maxIters) break; // out of budget — keep best effort
+
+    // Verification-driven re-probe: fetch the interactions the critique flagged
+    // as missing from the live page, then fold them into the next revision.
+    const newTargets = review.missingInteractions.filter((t) => {
+      const key = `${t.action}|${t.selector}`;
+      if (requestedSelectors.has(key)) return false;
+      requestedSelectors.add(key);
+      return true;
+    });
+    if (reprobeTargets && newTargets.length) {
+      onProgress({ phase: 'reprobe', iteration: i, targets: newTargets });
+      const fresh = await reprobeTargets(newTargets);
+      const before = states.length;
+      states = mergeInteractionStates(states, fresh);
+      onProgress({ phase: 'reprobe-done', iteration: i, added: states.length - before, total: states.length });
+    }
+
+    onProgress({ phase: 'revise', iteration: i });
+    html = await reviseReconstruction(component, html, review.issues, screenshot, render, apiKey, provider, states);
+  }
+
+  return { html, render: lastRender, interactions: states };
 }
 
 async function generateTags(stylesData, apiKey, provider) {
@@ -762,8 +967,9 @@ function showComponentPreview(comp, screenshotDataUrl) {
     screenshotEl.innerHTML = `<div class="no-screenshot">No screenshot available</div>`;
   }
 
-  // Interaction states arrive a moment later via INTERACTION_STATES — show a probing state for now
-  renderPreviewInteractions('probing');
+  // Interactions are now probed lazily, on "Reconstruct with AI" (the sweep runs
+  // on the live page at that point), not at pick time.
+  renderPreviewInteractions('deferred');
 
   // switchTab('components') already called renderComponents() before this
 }
@@ -773,9 +979,14 @@ function renderPreviewInteractions(status) {
   const el = document.getElementById('preview-interactions');
   if (!el) return;
 
+  if (status === 'deferred') {
+    el.style.display = 'block';
+    el.innerHTML = `<div class="interactions-label">⚡ Interactions are probed on the live page when you Reconstruct with AI</div>`;
+    return;
+  }
   if (status === 'probing') {
     el.style.display = 'block';
-    el.innerHTML = `<div class="interactions-label"><span class="spinner"></span> Probing interactions…</div>`;
+    el.innerHTML = `<div class="interactions-label"><span class="spinner"></span> Probing interactions on the page…</div>`;
     return;
   }
   if (!pendingInteractions.length) {
@@ -802,6 +1013,8 @@ function discardPreview() {
   document.getElementById('reconstruct-result').style.display = 'none';
   const intEl = document.getElementById('preview-interactions');
   if (intEl) { intEl.style.display = 'none'; intEl.innerHTML = ''; }
+  const verifyEl = document.getElementById('verify-progress');
+  if (verifyEl) { verifyEl.style.display = 'none'; verifyEl.innerHTML = ''; }
 }
 
 // Open an HTML string in a new tab as a standalone preview
@@ -846,14 +1059,37 @@ async function saveReconstructedComponent(reconstructedHtml) {
   toast(`Saved ${comp.category}`);
 }
 
-// Reconstruct with AI — on success shows the result panel with save/copy/preview options
+// Live progress panel for the agentic self-verification loop
+function makeVerifyUI() {
+  const el = document.getElementById('verify-progress');
+  el.style.display = 'block';
+  el.innerHTML = `<div class="verify-head"><span class="spinner"></span> <span class="verify-headline">Starting…</span></div><div class="verify-steps"></div>`;
+  const steps = el.querySelector('.verify-steps');
+  return {
+    setHead(text, spinning = true) {
+      el.querySelector('.verify-head').innerHTML =
+        `${spinning ? '<span class="spinner"></span> ' : '✓ '}<span class="verify-headline">${escapeHtml(text)}</span>`;
+    },
+    addStep(cls, icon, html) {
+      const d = document.createElement('div');
+      d.className = `verify-step ${cls || ''}`;
+      d.innerHTML = `<span class="verify-icon">${icon}</span><div class="verify-text">${html}</div>`;
+      steps.appendChild(d);
+    },
+  };
+}
+
+// Reconstruct with AI — runs the agentic generate→render→critique→revise loop,
+// streams progress, then shows the result panel with save/copy/preview options.
 async function reconstructCurrentComponent() {
   if (!pendingComponent) return;
 
   const errorEl = document.getElementById('preview-error');
   const resultEl = document.getElementById('reconstruct-result');
+  const verifyEl = document.getElementById('verify-progress');
   errorEl.style.display = 'none';
   resultEl.style.display = 'none';
+  if (verifyEl) { verifyEl.style.display = 'none'; verifyEl.innerHTML = ''; }
 
   const provider = await getAiProvider();
   const apiKey = provider === 'gemini' ? await getGeminiApiKey() : await getClaudeApiKey();
@@ -864,20 +1100,123 @@ async function reconstructCurrentComponent() {
     return;
   }
 
+  const effort = await getReconEffort();
+  const maxIters = EFFORT_TRIES[effort] || 3;
+
   const btn = document.getElementById('btn-preview-reconstruct');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Reconstructing…';
 
-  try {
-    const reconstructed = await reconstructComponent(pendingComponent, pendingScreenshot, apiKey, provider, pendingInteractions);
+  const verify = makeVerifyUI();
 
-    // Wire up result-panel buttons with the fresh HTML
+  // Deferred interaction sweep: run the probe on the live page now (it was NOT
+  // run at pick time). Falls back gracefully if the element is no longer there.
+  verify.setHead('Probing interactions on the live page…');
+  renderPreviewInteractions('probing');
+  try {
+    const resp = await sendToTab(currentTabId, {
+      type: 'REPROBE',
+      captureId: pendingComponent.capturedAt,
+      selector: pendingComponent.selector,
+      rect: pendingComponent.rect,
+    });
+    if (resp?.ok && Array.isArray(resp.states)) {
+      pendingInteractions = resp.states;
+      verify.addStep('pass', '✓', `Captured ${pendingInteractions.length} interaction state(s) from the live page.`);
+    } else {
+      pendingInteractions = [];
+      verify.addStep('', '•', 'Could not re-probe the element (page changed or navigated away) — using the resting capture only.');
+    }
+  } catch {
+    pendingInteractions = [];
+    verify.addStep('', '•', 'Live page not reachable — using the resting capture only.');
+  }
+  renderPreviewInteractions('done');
+
+  const onProgress = (p) => {
+    switch (p.phase) {
+      case 'generate':
+        verify.setHead('Generating initial reconstruction…');
+        break;
+      case 'no-reference':
+        verify.addStep('', '•', 'No reference screenshot — skipping visual verification.');
+        break;
+      case 'render':
+        verify.setHead(`Rendering the generated code (pass ${p.iteration})…`);
+        break;
+      case 'render-skip':
+        verify.addStep('fail', '!', 'Could not rasterize the render — keeping current output without further checks.');
+        break;
+      case 'critique':
+        verify.setHead(`Comparing render against the original (pass ${p.iteration})…`);
+        break;
+      case 'verdict': {
+        const pass = p.review.verdict === 'pass' || !p.review.issues.length;
+        const score = p.review.score != null ? ` · ${p.review.score}/100` : '';
+        const issues = p.review.issues.length
+          ? `<ul class="verify-issues">${p.review.issues.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ul>`
+          : '';
+        const compare = `<div class="verify-compare">
+            <figure><figcaption>Original</figcaption><img src="${p.reference}" alt="original" /></figure>
+            <figure><figcaption>Render (pass ${p.iteration})</figcaption><img src="${p.render}" alt="render" /></figure>
+          </div>`;
+        verify.addStep(
+          pass ? 'pass' : 'revise',
+          pass ? '✓' : '↻',
+          `<strong>Pass ${p.iteration}: ${pass ? 'visual match' : 'needs revision'}${score}</strong>${issues}${compare}`
+        );
+        break;
+      }
+      case 'reprobe':
+        verify.setHead(`Re-probing ${p.targets.length} flagged interaction(s) on the page…`);
+        break;
+      case 'reprobe-done':
+        verify.addStep('', '⚡', p.added > 0
+          ? `Captured ${p.added} more interaction state(s) (${p.total} total) and fed them back in.`
+          : 'No new interaction states found for the flagged triggers.');
+        break;
+      case 'revise':
+        verify.setHead(`Applying fixes (pass ${p.iteration})…`);
+        break;
+    }
+  };
+
+  // Targeted re-probe on the live page, driven by the critique's findings.
+  const reprobeTargets = async (targets) => {
+    try {
+      const resp = await sendToTab(currentTabId, {
+        type: 'REPROBE_TARGETS',
+        captureId: pendingComponent.capturedAt,
+        selector: pendingComponent.selector,
+        rect: pendingComponent.rect,
+        targets,
+      });
+      return (resp?.ok && Array.isArray(resp.states)) ? resp.states : [];
+    } catch {
+      return [];
+    }
+  };
+
+  try {
+    const { html: reconstructed, interactions: finalInteractions } = await agenticReconstruct(
+      pendingComponent, pendingScreenshot, apiKey, provider, pendingInteractions, onProgress,
+      { maxIters, reprobeTargets }
+    );
+
+    // Persist the (possibly augmented) interaction set for save + thumbnails.
+    pendingInteractions = finalInteractions || pendingInteractions;
+    renderPreviewInteractions('done');
+
+    verify.setHead('Reconstruction verified', false);
+
+    // Wire up result-panel buttons with the final HTML
     document.getElementById('btn-copy-reconstructed').onclick = () => copyText(reconstructed);
     document.getElementById('btn-preview-reconstructed').onclick = () => previewInTab(reconstructed);
     document.getElementById('btn-save-reconstructed').onclick = () => saveReconstructedComponent(reconstructed);
 
     resultEl.style.display = 'block';
   } catch (err) {
+    verify.setHead('Reconstruction failed', false);
     errorEl.textContent = `Reconstruction failed: ${err.message}`;
     errorEl.style.display = 'block';
   } finally {
@@ -1660,6 +1999,13 @@ ${pendingComponent.css}</style></head><body><div>${pendingComponent.html}</div><
   document.getElementById('btn-save-component').addEventListener('click', saveRawComponent);
   document.getElementById('btn-preview-reconstruct').addEventListener('click', reconstructCurrentComponent);
 
+  // Reconstruction effort selector (persisted)
+  const effortSel = document.getElementById('recon-effort');
+  if (effortSel) {
+    getReconEffort().then((e) => { effortSel.value = e; });
+    effortSel.addEventListener('change', () => saveReconEffort(effortSel.value));
+  }
+
   // Modal close
   document.getElementById('modal-close').addEventListener('click', () => {
     document.getElementById('component-modal').style.display = 'none';
@@ -1668,23 +2014,6 @@ ${pendingComponent.css}</style></head><body><div>${pendingComponent.html}</div><
     if (e.target === document.getElementById('component-modal')) {
       document.getElementById('component-modal').style.display = 'none';
     }
-  });
-
-  // Dedicated request/response listener for the interaction planner. Kept
-  // separate from the async listener below so we can return true and respond
-  // asynchronously (Chrome doesn't support that from an async listener).
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type !== 'PROBE_PLAN') return; // other listener handles the rest
-    (async () => {
-      try {
-        const plan = await computeProbePlan(message);
-        sendResponse({ ok: !!plan, plan: plan || [] });
-      } catch (err) {
-        console.warn('[atomic-strip] plan failed:', err);
-        sendResponse({ ok: false, plan: [] });
-      }
-    })();
-    return true; // keep the channel open for the async sendResponse
   });
 
   // Background messages (from content script / tab events)
@@ -1717,18 +2046,6 @@ ${pendingComponent.css}</style></head><body><div>${pendingComponent.html}</div><
         switchTab('components');
         showComponentPreview(comp, croppedDataUrl);
         document.getElementById('picker-status').textContent = '';
-        break;
-      }
-
-      // Interaction probe finished in the page — attach revealed states to the
-      // pending component so "Reconstruct with AI" can include them.
-      case 'INTERACTION_STATES': {
-        if (!pendingComponent) break;
-        // Match the states to the component currently in preview (capturedAt === captureId)
-        if (message.captureId != null && pendingComponent.capturedAt != null &&
-            message.captureId !== pendingComponent.capturedAt) break;
-        pendingInteractions = Array.isArray(message.states) ? message.states : [];
-        renderPreviewInteractions('done');
         break;
       }
 

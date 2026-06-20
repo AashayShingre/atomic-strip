@@ -447,7 +447,7 @@
   // state. All states are sent to the side panel to feed "Generate with AI".
   // ─────────────────────────────────────────────
 
-  const PROBE_MAX = 5;        // cap how many interactive parts we exercise
+  const PROBE_MAX = 16;       // cap how many interactive parts we exercise
   const PROBE_SETTLE_MS = 340; // wait for transitions / JS after hover
   const PROBE_RESET_MS = 180;  // wait after un-hover before the next probe
   const FORCE_STATE_CLASS = '__as_force_state__';
@@ -660,7 +660,9 @@
   function hideCursor() { probeCursor?.remove(); probeCursor = null; }
 
   const INTERACTIVE_SEL = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[title],[tabindex],[data-interaction]';
-  const PLAN_TIMEOUT_MS = 25000;
+  const NESTED_PARENTS = 2;     // revealed parents expanded one level deeper
+  const NESTED_CHILDREN = 3;    // revealed children probed per expanded parent
+  const MAX_STATES = 12;        // hard cap on states captured per component
 
   // Perform a single action on an element. Returns a cleanup fn that reverses it.
   function performAction(el, action) {
@@ -691,8 +693,18 @@
     return () => { dispatchUnhover(el); undoForce(); };
   }
 
-  // Run a single planned action from the resting state, capturing the result.
-  async function probeAction(root, el, action) {
+  // Hide the visible probe cursor while a screenshot is taken so it never
+  // appears in captured states (and so no-op detection stays reliable).
+  async function captureHidingCursor() {
+    if (probeCursor) probeCursor.style.display = 'none';
+    const dataUrl = await requestScreenshot();
+    if (probeCursor) probeCursor.style.display = '';
+    return dataUrl;
+  }
+
+  // Run a single action from the resting state, capturing the result.
+  // Returns null for no-ops (nothing changed) so they don't clutter the output.
+  async function probeAction(root, el, action, baselineFull) {
     const mutations = [];
     const obs = new MutationObserver((m) => mutations.push(...m));
     obs.observe(document.body, {
@@ -709,11 +721,18 @@
     const summary = summarizeMutations(mutations);
     const rect = probeUnionRect(root, [...summary.addedEls, el]);
     const dpr = window.devicePixelRatio || 1;
-    const full = await requestScreenshot();
-    const screenshot = await cropInPage(full, rect, dpr);
+    const afterFull = await captureHidingCursor();
+    const screenshot = await cropInPage(afterFull, rect, dpr);
 
     undo();
     await sleep(PROBE_RESET_MS);
+
+    // No DOM change AND the same pixels as the resting state → nothing happened.
+    const changed = summary.addedNodes.length || summary.attrChanges.length;
+    if (!changed && baselineFull) {
+      const baseCrop = await cropInPage(baselineFull, rect, dpr);
+      if (baseCrop && baseCrop === screenshot) return null;
+    }
 
     return {
       label: `${action} ${describeEl(el)}`,
@@ -727,7 +746,7 @@
   }
 
   // Capture a nested step: parent is already open; act on a revealed child.
-  async function probeChildOpen(root, parentEl, childEl, action) {
+  async function probeChildOpen(root, parentEl, childEl, action, baselineFull) {
     const mutations = [];
     const obs = new MutationObserver((m) => mutations.push(...m));
     obs.observe(document.body, {
@@ -744,11 +763,17 @@
     const summary = summarizeMutations(mutations);
     const rect = probeUnionRect(root, [...summary.addedEls, parentEl, childEl]);
     const dpr = window.devicePixelRatio || 1;
-    const full = await requestScreenshot();
-    const screenshot = await cropInPage(full, rect, dpr);
+    const afterFull = await captureHidingCursor();
+    const screenshot = await cropInPage(afterFull, rect, dpr);
 
     undo();
     await sleep(PROBE_RESET_MS);
+
+    const changed = summary.addedNodes.length || summary.attrChanges.length;
+    if (!changed && baselineFull) {
+      const baseCrop = await cropInPage(baselineFull, rect, dpr);
+      if (baseCrop && baseCrop === screenshot) return null;
+    }
 
     return {
       label: `${describeEl(parentEl)} → ${action} ${describeEl(childEl)}`,
@@ -774,107 +799,52 @@
     return set;
   }
 
-  function candidateInfo(el, i) {
-    const attrs = [];
-    ['role', 'aria-haspopup', 'aria-expanded', 'data-tooltip', 'title', 'href'].forEach((a) => {
-      const v = el.getAttribute && el.getAttribute(a);
-      if (v) attrs.push(`${a}="${String(v).slice(0, 40)}"`);
-    });
-    return {
-      index: i,
-      selector: describeEl(el),
-      tag: el.tagName.toLowerCase(),
-      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 50),
-      attrs,
-    };
-  }
-
-  async function captureComponentShot(root) {
-    const rect = probeUnionRect(root, []);
-    const full = await requestScreenshot();
-    return cropInPage(full, rect, window.devicePixelRatio || 1);
-  }
-
-  // Ask the side panel (which holds the LLM API key) for an action plan.
-  // Resolves to an array of {index, action} or null (→ caller falls back).
-  function requestPlan(payload) {
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (v) => { if (!done) { done = true; resolve(v); } };
-      const timer = setTimeout(() => finish(null), PLAN_TIMEOUT_MS);
-      try {
-        chrome.runtime.sendMessage({ type: 'PROBE_PLAN', ...payload }, (resp) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError) { finish(null); return; }
-          finish(resp && resp.ok && Array.isArray(resp.plan) ? resp.plan : null);
-        });
-      } catch { clearTimeout(timer); finish(null); }
-    });
-  }
-
-  // Hybrid agentic probe: LLM plans → deterministic execution → one re-plan
-  // round for nested depth. Falls back to a heuristic sweep if no plan is
-  // available (side panel closed, no API key, planner error, or timeout).
+  // Heuristic interaction probe — NO AI. Runs at pick time: it exercises EVERY
+  // interactive part of the component (hover), records what each reveals, and
+  // screenshots it, then explores one level of nested UI for parts that opened
+  // something. The captured states are sent to the side panel and are only fed
+  // to the LLM later, when the user clicks "Reconstruct with AI".
   async function runInteractionProbe(root, captureId) {
     showCursor();
     const states = [];
     try {
       const candidates = findCandidates(root);
       const baselineVisible = currentInteractive();
-      const componentShot = await captureComponentShot(root);
+      const baselineFull = await captureHidingCursor();
 
-      const plan = await requestPlan({
-        phase: 'initial',
-        captureId,
-        html: root.outerHTML.slice(0, 6000),
-        css: getRelevantCSS(root).slice(0, 4000),
-        screenshot: componentShot,
-        candidates: candidates.map(candidateInfo),
-      });
-
-      // LLM plan (efficient) or heuristic fallback (probe each candidate w/ hover)
-      const planned = (plan && plan.length)
-        ? plan.filter((a) => candidates[a.index]).map((a) => ({ el: candidates[a.index], action: a.action || 'hover' }))
-        : candidates.map((el) => ({ el, action: 'hover' }));
-
+      // Top-level pass: probe every interactive part.
       const expandable = [];
-      for (const step of planned) {
+      for (const el of candidates) {
+        if (states.length >= MAX_STATES) break;
         try {
-          const state = await probeAction(root, step.el, step.action);
-          if (state.screenshot) states.push(state);
-          if (state.addedNodes && state.addedNodes.length) expandable.push(step.el);
+          const state = await probeAction(root, el, 'hover', baselineFull);
+          if (state && state.screenshot) {
+            states.push(state);
+            if (state.addedNodes && state.addedNodes.length) expandable.push(el);
+          }
         } catch (err) {
           console.warn('[atomic-strip] action failed:', err);
         }
       }
 
-      // One re-plan round (only when an actual planner is in play) to explore
-      // UI revealed by the first pass — e.g. a submenu inside an opened menu.
-      if (plan && expandable.length) {
-        const parentEl = expandable[0];
+      // Nested pass: for parts that revealed new UI, open them and probe the
+      // newly-revealed interactive elements (one level deep).
+      for (const parentEl of expandable.slice(0, NESTED_PARENTS)) {
+        if (states.length >= MAX_STATES) break;
         const undoParent = await openState(parentEl);
         try {
+          const baselineFull2 = await captureHidingCursor();
           const revealed = [];
           document.querySelectorAll(INTERACTIVE_SEL).forEach((e) => {
             if (isVisible(e) && !baselineVisible.has(e)) revealed.push(e);
           });
-          if (revealed.length) {
-            const childPlan = await requestPlan({
-              phase: 'replan',
-              captureId,
-              parent: describeEl(parentEl),
-              candidates: revealed.slice(0, 12).map(candidateInfo),
-              history: states.map((s) => ({ trigger: s.trigger, added: s.addedNodes.map((n) => n.selector) })),
-            });
-            for (const a of (childPlan || []).slice(0, 2)) {
-              const child = revealed[a.index];
-              if (!child) continue;
-              try {
-                const state = await probeChildOpen(root, parentEl, child, a.action || 'hover');
-                if (state.screenshot) states.push(state);
-              } catch (err) {
-                console.warn('[atomic-strip] nested action failed:', err);
-              }
+          for (const child of revealed.slice(0, NESTED_CHILDREN)) {
+            if (states.length >= MAX_STATES) break;
+            try {
+              const state = await probeChildOpen(root, parentEl, child, 'hover', baselineFull2);
+              if (state && state.screenshot) states.push(state);
+            } catch (err) {
+              console.warn('[atomic-strip] nested action failed:', err);
             }
           }
         } finally {
@@ -887,12 +857,91 @@
       document.documentElement.classList.remove(FORCE_STATE_CLASS);
     }
 
-    // Strip live element refs (addedEls) before sending across contexts
-    const clean = states.map((s) => ({
+    // Strip live element refs (addedEls) before returning across contexts
+    const clean = states.slice(0, MAX_STATES).map((s) => ({
       label: s.label, trigger: s.trigger, action: s.action,
       addedNodes: s.addedNodes, attrChanges: s.attrChanges, screenshot: s.screenshot,
     }));
-    chrome.runtime.sendMessage({ type: 'INTERACTION_STATES', captureId, states: clean }).catch(() => {});
+    return clean;
+  }
+
+  // Targeted re-probe — exercise specific elements/actions the AGENT asked for
+  // (verification-driven). `targets` = [{ selector, action }]. Returns states.
+  async function probeTargets(rootEl, targets) {
+    showCursor();
+    const out = [];
+    try {
+      const baselineFull = await captureHidingCursor();
+      for (const t of (targets || [])) {
+        if (out.length >= MAX_STATES) break;
+        const action = (t.action === 'click' || t.action === 'focus') ? t.action : 'hover';
+        const sel = (t.selector || '').trim();
+        let el = null;
+        if (sel === ':root' || sel === '') {
+          el = rootEl;
+        } else {
+          try { el = rootEl.querySelector(sel); } catch {}
+          if (!el) { try { el = document.querySelector(sel); } catch {} }
+        }
+        if (!el) continue;
+        try {
+          const state = await probeAction(rootEl, el, action, baselineFull);
+          if (state && state.screenshot) {
+            out.push({
+              label: state.label, trigger: state.trigger, action: state.action,
+              addedNodes: state.addedNodes, attrChanges: state.attrChanges, screenshot: state.screenshot,
+            });
+          }
+        } catch (err) {
+          console.warn('[atomic-strip] target probe failed:', err);
+        }
+      }
+    } finally {
+      hideCursor();
+      document.documentElement.classList.remove(FORCE_STATE_CLASS);
+    }
+    return out;
+  }
+
+  // The most recently picked element is kept live so the interaction sweep can
+  // run later (at "Reconstruct with AI" time) on the real node without a reload.
+  let lastPicked = null;
+
+  // Build a reasonably-unique CSS selector for re-locating an element after the
+  // live reference is lost (e.g. content script re-injected). Best-effort.
+  function cssPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) { try { return `#${CSS.escape(el.id)}`; } catch { return `#${el.id}`; } }
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.documentElement) {
+      if (node.id) { try { parts.unshift(`#${CSS.escape(node.id)}`); } catch { parts.unshift(`#${node.id}`); } break; }
+      let sel = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (parent) {
+        const sameTag = [...parent.children].filter((c) => c.tagName === node.tagName);
+        if (sameTag.length > 1) sel += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+      }
+      parts.unshift(sel);
+      node = node.parentElement;
+    }
+    return parts.join(' > ');
+  }
+
+  // Re-locate a picked element for a deferred sweep: prefer the live reference,
+  // then the stored selector, then a hit-test at the captured rect center.
+  function locatePicked(captureId, selector, rect) {
+    if (lastPicked && lastPicked.id === captureId && lastPicked.el && lastPicked.el.isConnected) {
+      return lastPicked.el;
+    }
+    if (selector) {
+      try { const el = document.querySelector(selector); if (el) return el; } catch {}
+    }
+    if (rect && rect.width) {
+      const el = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (el) return el;
+    }
+    return null;
   }
 
   async function captureElement(el) {
@@ -933,13 +982,16 @@
       url: location.href,
       domain: location.hostname,
       capturedAt: captureId,
-      devicePixelRatio: window.devicePixelRatio || 1
+      devicePixelRatio: window.devicePixelRatio || 1,
+      selector: cssPath(el)
     };
 
-    // Send the resting capture immediately (background attaches the baseline
-    // screenshot), then run the interaction probe and stream states afterward.
+    // Keep the live node so the interaction sweep can run later on demand.
+    lastPicked = { id: captureId, el };
+
+    // Send the resting capture (background attaches the baseline screenshot).
+    // The interaction sweep is deferred to "Reconstruct with AI" (REPROBE).
     chrome.runtime.sendMessage({ type: 'ELEMENT_CAPTURED', data });
-    runInteractionProbe(el, captureId);
   }
 
   function startPicker() {
@@ -1017,6 +1069,38 @@
         stopPicker();
         sendResponse({ ok: true });
         break;
+
+      // Deferred interaction sweep, triggered by "Reconstruct with AI".
+      case 'REPROBE': {
+        (async () => {
+          try {
+            const el = locatePicked(message.captureId, message.selector, message.rect);
+            if (!el) { sendResponse({ ok: false, reason: 'not-found' }); return; }
+            el.scrollIntoView({ block: 'center', inline: 'center' });
+            await sleep(120);
+            const states = await runInteractionProbe(el, message.captureId);
+            sendResponse({ ok: true, states });
+          } catch (err) {
+            sendResponse({ ok: false, reason: err?.message || 'probe-failed' });
+          }
+        })();
+        return true; // keep the channel open for the async sendResponse
+      }
+
+      // Targeted re-probe of specific triggers requested by the agent.
+      case 'REPROBE_TARGETS': {
+        (async () => {
+          try {
+            const root = locatePicked(message.captureId, message.selector, message.rect);
+            if (!root) { sendResponse({ ok: false, reason: 'not-found' }); return; }
+            const states = await probeTargets(root, message.targets);
+            sendResponse({ ok: true, states });
+          } catch (err) {
+            sendResponse({ ok: false, reason: err?.message || 'probe-failed' });
+          }
+        })();
+        return true; // keep the channel open for the async sendResponse
+      }
     }
     return false;
   });

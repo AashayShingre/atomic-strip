@@ -17,7 +17,8 @@ Three tabs: **Styles** (extracted design tokens), **Components** (picked UI elem
 | `content.js` | Injected into pages — style extraction + element picker |
 | `sidepanel.html` | UI shell — 3 tabs, settings panel, component modal |
 | `sidepanel.css` | Dark theme UI, purple accent (`#7B68EE`) |
-| `sidepanel.js` | All logic — rendering, storage, Claude API calls |
+| `sidepanel.js` | All logic — rendering, storage, Claude API calls, agentic reconstruction loop |
+| `vendor/html2canvas.min.js` | DOM→canvas rasterizer — used to screenshot the generated component for visual self-verification |
 | `icons/` | 16/48/128px atom PNGs |
 
 ---
@@ -78,19 +79,44 @@ Side panel ignores any `ELEMENT_CAPTURED` without `_forwarded: true` to avoid do
 
 `sendToTab()` in sidepanel.js handles "Receiving end does not exist" by re-injecting content.js via `chrome.scripting.executeScript` and retrying.
 
-### Interaction probe (hybrid agentic flow)
+### Interaction probe (heuristic — runs at RECONSTRUCT time, not at pick)
 
-After `captureElement` fires `ELEMENT_CAPTURED`, content.js runs `runInteractionProbe(el, captureId)` — a **plan → execute → re-plan** loop (the LLM decides *what* to probe; content.js does the DOM work):
+The sweep is **deferred**: `captureElement` no longer probes. At pick time it only fires `ELEMENT_CAPTURED`, stashes the **live node** (`lastPicked = { id, el }`), and stores a fallback `selector` (`cssPath`) on the component. The sweep runs later, when the user clicks **"Reconstruct with AI"** — the side panel sends `REPROBE { captureId, selector, rect }` to the page, content.js re-locates the element via `locatePicked()` (live ref → `querySelector(selector)` → `elementFromPoint(rect center)`), runs `runInteractionProbe(el, captureId)`, and returns the states through `sendResponse`. If the element can't be found (page navigated / re-rendered), it returns `{ ok:false }` and reconstruction proceeds with the resting capture only.
 
-1. **Plan (LLM "decide" step):** content.js builds candidates via `findCandidates()` (root + buttons/links/`[aria-*]`/`[data-tooltip]`/`cursor:pointer`, capped at `PROBE_MAX`=5) + a resting screenshot, and sends `PROBE_PLAN {phase:'initial', html, css, screenshot, candidates}` to the side panel. `computeProbePlan()` (sidepanel.js) calls the LLM (`planInitialInteractions`) which returns a pruned action list `[{index, action: hover|focus|click}]`. **If no API key / side panel closed / timeout (25s) / error → content.js falls back to a heuristic sweep** (hover every candidate).
-2. **Execute (deterministic):** for each planned action, a cursor glides over the element, `performAction()` applies it — `applyForcedHover()` injects matching `:hover`/`:focus` rules scoped under `.__as_force_state__` on `<html>` (synthetic events can't trigger native `:hover`); `click` is wrapped with a capture-phase `preventDefault` so handlers run without navigating. A `MutationObserver` on `document.body` records added nodes (incl. portaled popovers) + attr flips; `probeUnionRect()` is screenshotted via `CAPTURE_VISIBLE` (background, throttled) and cropped in-page. State resets between actions.
-3. **Re-plan (one round, nested depth):** if a first-pass action revealed new DOM, content.js re-opens that parent, diffs newly-visible interactive elements vs baseline, and sends `PROBE_PLAN {phase:'replan', parent, candidates, history}`. The LLM (`planReplanInteractions`) picks ≤2 follow-up actions, executed via `probeChildOpen()` (parent kept open) to capture nested states (e.g. submenu inside an opened menu).
+Why deferred: captures you never reconstruct cost zero probing, picks are instant, and the live page is available so the sweep (and future AI-directed exploration) can run on the real DOM.
 
-Content → side panel (request/response): `PROBE_PLAN {...}` → `{ ok, plan: [{index, action}] }` (handled by a dedicated non-async `onMessage` listener that returns `true`).
+**This uses NO AI** (the sweep itself is deterministic) — the LLM is only invoked during reconstruction. The heuristic sweep:
 
-Content → All: `INTERACTION_STATES { captureId, states: [{ trigger, action, addedNodes, attrChanges, screenshot }] }`
+1. **Candidates:** `findCandidates()` collects up to `PROBE_MAX`(16) interactive parts (root + buttons/links/`[aria-*]`/`[data-tooltip]`/`[tabindex]`/`cursor:pointer`/`[data-interaction]`), scored so the root + likely-interactive elements come first.
+2. **Top-level pass:** every candidate is hovered via `probeAction()`. `performAction()` applies the action — `applyForcedHover()` injects matching `:hover`/`:focus` rules scoped under `.__as_force_state__` on `<html>` (synthetic events can't trigger native `:hover`); `click` (used only in nesting) is wrapped with a capture-phase `preventDefault` so handlers run without navigating. A `MutationObserver` on `document.body` records added nodes (incl. portaled popovers) + attr flips; `probeUnionRect()` is screenshotted via `CAPTURE_VISIBLE` (background, throttled) and cropped in-page. State resets between actions.
+3. **No-op filtering:** the probe cursor is hidden during each capture (`captureHidingCursor()`), and a state is dropped if it produced no DOM change AND its cropped pixels are byte-identical to the resting baseline — so plain links that do nothing don't clutter the output.
+4. **Nested pass (heuristic, one level):** for up to `NESTED_PARENTS`(2) parents that revealed new UI, re-open the parent and probe up to `NESTED_CHILDREN`(3) newly-revealed interactive elements via `probeChildOpen()` (parent kept open) — e.g. a submenu inside an opened menu.
 
-Side panel matches `captureId` to `pendingComponent.capturedAt`, stores `pendingInteractions`, shows thumbnails in the preview panel, and feeds them into `reconstructComponent(..., interactions)` — multiple labeled images + a text "Observed interaction states" spec marked as ground truth. Specs (minus images) persist on the saved component as `comp.interactions`.
+Total states are capped at `MAX_STATES`(12).
+
+Side panel ⇄ Content (request/response):
+- `REPROBE { captureId, selector, rect }` → `{ ok, states: [...] }` — full heuristic sweep of the picked element.
+- `REPROBE_TARGETS { captureId, selector, rect, targets:[{ selector, action }] }` → `{ ok, states: [...] }` — targeted re-probe of specific triggers the agent flagged.
+
+State shape: `{ trigger, action, addedNodes, attrChanges, screenshot }`; failures return `{ ok:false, reason }`.
+
+The LLM is used **only** at reconstruct time: `reconstructComponent(component, screenshot, apiKey, provider, interactions)` feeds the resting screenshot + every captured interaction screenshot + an "Observed interaction states" spec (treated as ground truth) into a generation call.
+
+### Agentic reconstruction loop (the AI agent — runs ONLY on "Reconstruct with AI")
+
+"Reconstruct with AI" is not a one-shot call. `agenticReconstruct()` runs a self-correcting **generate → render → critique → (re-probe) → revise** loop so the model sees and fixes its own output:
+
+1. **Generate** — `reconstructComponent()` produces the initial HTML.
+2. **Render** — `renderHtmlToImage()` mounts the generated HTML in an isolated offscreen `<iframe srcdoc>` (inside `#render-harness`) and rasterizes it to a PNG with **html2canvas**. Inline `<script>` does NOT run (extension CSP), so this captures the **resting visual state**. Returns `null` (and the loop gracefully stops) if rasterization fails (e.g. tainted cross-origin images).
+3. **Critique** — `critiqueReconstruction()` sends two images to the LLM (IMAGE 1 = original capture, IMAGE 2 = the render) plus the component HTML and the list of already-captured interaction triggers. Returns JSON `{ verdict, score, issues, missingInteractions }`. Part A judges resting-state fidelity only (ignores JS-only reveals — avoids false negatives); Part B flags interactive affordances visible in the original whose behavior hasn't been captured yet (`missingInteractions: [{ selector, action, why }]`).
+4. **Verification-driven re-probe** — if the critique flagged `missingInteractions`, `reprobeTargets()` sends `REPROBE_TARGETS { captureId, selector, rect, targets }` to the page; content.js `probeTargets()` exercises those exact selectors/actions on the **live original** and returns fresh states, which are merged (de-duped by trigger, `mergeInteractionStates`) into the interaction set. A `requestedSelectors` guard prevents re-probing the same trigger across iterations.
+5. **Revise** — `reviseReconstruction()` feeds the current HTML + the issue list + both images + the (now augmented) interaction set back to the model for a corrected full HTML, then loops.
+
+**Effort toggle** (`#recon-effort`, persisted as `reconEffort`): Low/Medium/High → `EFFORT_TRIES` = **1 / 3 / 5** passes (`maxIters`). The loop **closes early** when it's good enough — resting `pass` (score ≥ 85, no issues) **and** no missing interactions. It also stops when render/rasterize fails or the pass budget runs out. At Low (1 pass) there's no revise/re-probe — just generate + one critique. Each phase streams to the `#verify-progress` panel via `onProgress` (headline, per-pass verdict, issue list, Original-vs-Render thumbnails, re-probe results). If there's no reference screenshot, verification is skipped and the first generation is returned.
+
+> Resting fidelity is verified by actually rendering the output. Interactions are NOT rendered (iframe can't run their JS) — instead the agent improves them by **re-probing the live original** for affordances the critique says are missing, then feeding richer ground truth into the next revision. `agenticReconstruct` returns the final (augmented) interaction set, which is what gets saved.
+
+On "Reconstruct with AI", the side panel first runs the deferred `REPROBE` sweep, stores the returned states in `pendingInteractions`, shows thumbnails in the preview panel, then feeds them into `reconstructComponent(..., interactions)` — multiple labeled images + a text "Observed interaction states" spec marked as ground truth. Specs (minus images) persist on the saved component as `comp.interactions`. (Saving raw HTML/CSS without reconstructing therefore stores no interaction specs, since the sweep hasn't run.)
 
 Background → All captures (baseline + probe) go through `queuedCapture()` which serializes `captureVisibleTab` calls ≥700ms apart (it is rate-limited to ~2/sec).
 
@@ -100,10 +126,11 @@ Background → All captures (baseline + probe) go through `queuedCapture()` whic
 
 Three calls, all using `claude-opus-4-6`, max 4096 tokens:
 
-1. **reconstructComponent(comp, screenshotDataUrl, apiKey)**
+1. **reconstructComponent(comp, screenshotDataUrl, apiKey)** + the verification loop
    - Input: outerHTML + filtered CSS (resolved vars) + screenshot + font list
    - Output: single self-contained `.html` file (no markdown, no explanation)
    - Goal: replicate look + infer/implement interactions in vanilla JS
+   - Wrapped by `agenticReconstruct()`, which adds up to 3 extra LLM calls: `critiqueReconstruction()` (vision compare → JSON verdict) and `reviseReconstruction()` (fix the listed issues). See "Agentic reconstruction loop" above.
 
 2. **generateTags(stylesData, apiKey)**
    - Input: color hexes, font families, size range, border radii, domain

@@ -591,6 +591,92 @@ html, body {
   flex-wrap: wrap;
 }
 
+.effort-select {
+  font-family: inherit;
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated, #1a1a26);
+  color: var(--text-secondary, #9a9ab0);
+  cursor: pointer;
+}
+.effort-select:focus { outline: none; border-color: var(--accent); }
+
+/* ── Agentic self-verification loop ── */
+.verify-progress {
+  padding: 8px 14px 4px;
+  border-top: 1px solid var(--border-light);
+}
+
+.verify-progress .verify-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.verify-step {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 11px;
+  color: var(--text-secondary, #9a9ab0);
+  padding: 5px 0;
+  border-top: 1px dashed var(--border-light);
+}
+
+.verify-step:first-of-type { border-top: none; }
+
+.verify-step .verify-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  text-align: center;
+}
+
+.verify-step.pass .verify-icon { color: var(--success); }
+.verify-step.revise .verify-icon { color: var(--accent); }
+.verify-step.fail .verify-icon { color: var(--danger); }
+
+.verify-step .verify-text { flex: 1; line-height: 1.4; }
+
+.verify-step .verify-issues {
+  margin: 4px 0 0;
+  padding-left: 14px;
+  color: var(--text-dim);
+}
+
+.verify-compare {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.verify-compare figure {
+  margin: 0;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.verify-compare figcaption {
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-bottom: 3px;
+}
+
+.verify-compare img {
+  width: 100%;
+  height: auto;
+  max-height: 120px;
+  object-fit: contain;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #fff;
+  display: block;
+}
+
 .preview-error {
   margin: 0 14px 10px;
   font-size: 11px;
