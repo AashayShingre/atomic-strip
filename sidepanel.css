@@ -539,6 +539,51 @@ html, body {
   padding: 24px;
 }
 
+.preview-interactions {
+  padding: 8px 14px 2px;
+}
+
+.preview-interactions .interactions-label {
+  font-size: 11px;
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.preview-interactions .interaction-thumbs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.preview-interactions .interaction-thumb {
+  flex: 0 0 auto;
+  width: 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.preview-interactions .interaction-thumb img {
+  width: 96px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid rgba(123,104,238,0.4);
+  background: #d0d0d0;
+}
+
+.preview-interactions .interaction-thumb span {
+  font-size: 9px;
+  color: #999;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .preview-actions {
   display: flex;
   gap: 7px;

@@ -64,19 +64,35 @@ sidepanel.js (side panel)
 ```
 
 **IndexedDB** (`atomic-strip` db, v1)
-- `components` store — `{ id, html, css, rect, tag, category, fontFamilies, url, domain, capturedAt, devicePixelRatio, reconstructed? }`
+- `components` store — `{ id, html, css, rect, tag, category, fontFamilies, url, domain, capturedAt, devicePixelRatio, reconstructed?, interactions? }` (`interactions` = probe specs: `[{ trigger, addedNodes, attrChanges }]`, images stripped)
 - `screenshots` store — `{ id, dataUrl }` — blob data lives here (too large for chrome.storage)
 
 ---
 
 ## Message flow (critical)
 
-Content → Background: `ELEMENT_CAPTURED { data, type }`
+Content → Background: `ELEMENT_CAPTURED { data, type }` (data.capturedAt is the captureId)
 Background → All: `ELEMENT_CAPTURED { data, type, screenshotDataUrl, _forwarded: true }`
 
 Side panel ignores any `ELEMENT_CAPTURED` without `_forwarded: true` to avoid double-handling (content.js broadcasts to everyone, background forwards enriched copy).
 
 `sendToTab()` in sidepanel.js handles "Receiving end does not exist" by re-injecting content.js via `chrome.scripting.executeScript` and retrying.
+
+### Interaction probe (hybrid agentic flow)
+
+After `captureElement` fires `ELEMENT_CAPTURED`, content.js runs `runInteractionProbe(el, captureId)` — a **plan → execute → re-plan** loop (the LLM decides *what* to probe; content.js does the DOM work):
+
+1. **Plan (LLM "decide" step):** content.js builds candidates via `findCandidates()` (root + buttons/links/`[aria-*]`/`[data-tooltip]`/`cursor:pointer`, capped at `PROBE_MAX`=5) + a resting screenshot, and sends `PROBE_PLAN {phase:'initial', html, css, screenshot, candidates}` to the side panel. `computeProbePlan()` (sidepanel.js) calls the LLM (`planInitialInteractions`) which returns a pruned action list `[{index, action: hover|focus|click}]`. **If no API key / side panel closed / timeout (25s) / error → content.js falls back to a heuristic sweep** (hover every candidate).
+2. **Execute (deterministic):** for each planned action, a cursor glides over the element, `performAction()` applies it — `applyForcedHover()` injects matching `:hover`/`:focus` rules scoped under `.__as_force_state__` on `<html>` (synthetic events can't trigger native `:hover`); `click` is wrapped with a capture-phase `preventDefault` so handlers run without navigating. A `MutationObserver` on `document.body` records added nodes (incl. portaled popovers) + attr flips; `probeUnionRect()` is screenshotted via `CAPTURE_VISIBLE` (background, throttled) and cropped in-page. State resets between actions.
+3. **Re-plan (one round, nested depth):** if a first-pass action revealed new DOM, content.js re-opens that parent, diffs newly-visible interactive elements vs baseline, and sends `PROBE_PLAN {phase:'replan', parent, candidates, history}`. The LLM (`planReplanInteractions`) picks ≤2 follow-up actions, executed via `probeChildOpen()` (parent kept open) to capture nested states (e.g. submenu inside an opened menu).
+
+Content → side panel (request/response): `PROBE_PLAN {...}` → `{ ok, plan: [{index, action}] }` (handled by a dedicated non-async `onMessage` listener that returns `true`).
+
+Content → All: `INTERACTION_STATES { captureId, states: [{ trigger, action, addedNodes, attrChanges, screenshot }] }`
+
+Side panel matches `captureId` to `pendingComponent.capturedAt`, stores `pendingInteractions`, shows thumbnails in the preview panel, and feeds them into `reconstructComponent(..., interactions)` — multiple labeled images + a text "Observed interaction states" spec marked as ground truth. Specs (minus images) persist on the saved component as `comp.interactions`.
+
+Background → All captures (baseline + probe) go through `queuedCapture()` which serializes `captureVisibleTab` calls ≥700ms apart (it is rate-limited to ~2/sec).
 
 ---
 
@@ -125,7 +141,6 @@ API key stored in `chrome.storage.local`. If absent, inline error shown (not toa
 
 ## What is NOT done yet (planned)
 
-- **Behavior recording** (Phase 2 of interactions plan) — MutationObserver records DOM/class/ARIA state changes while user demonstrates interactions; compact JSON spec passed to LLM alongside HTML/CSS
 - **Framework introspection** (Phase 1 of interactions plan) — Read `__reactFiber`, `__vue__`, `_x_dataStack` on selected element to surface event handler source
 - **Cross-device sync** — Currently all storage is local; Supabase/Firebase backend planned
 - **Export** — No way to export a saved design system as a file yet

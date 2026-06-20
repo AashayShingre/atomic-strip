@@ -275,7 +275,108 @@ async function callLLM(systemPrompt, userContent, apiKey, provider) {
   }
 }
 
-async function reconstructComponent(component, screenshotDataUrl, apiKey, provider) {
+// ─────────────────────────────────────────────
+// INTERACTION PLANNER (LLM "decide" step for the hybrid agentic probe)
+// content.js asks (PROBE_PLAN) which elements to interact with; we let the LLM
+// choose, returning a compact action list. content.js executes deterministically.
+// ─────────────────────────────────────────────
+
+function parsePlanArray(raw) {
+  if (!raw) return [];
+  const match = raw.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  let arr;
+  try { arr = JSON.parse(match[0]); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  const allowed = new Set(['hover', 'focus', 'click']);
+  return arr
+    .filter((a) => a && Number.isInteger(a.index))
+    .map((a) => ({ index: a.index, action: allowed.has(a.action) ? a.action : 'hover', reason: a.reason || '' }))
+    .slice(0, 5);
+}
+
+async function planInitialInteractions(message, apiKey, provider) {
+  const candList = (message.candidates || [])
+    .map((c) => `${c.index}: <${c.tag}> "${c.text}" ${(c.attrs || []).join(' ')} [${c.selector}]`)
+    .join('\n');
+
+  const content = [];
+  if (message.screenshot) {
+    const b64 = message.screenshot.split(',')[1];
+    if (b64) {
+      content.push({ type: 'text', text: 'Resting-state screenshot of the component:' });
+      content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: b64 } });
+    }
+  }
+  content.push({
+    type: 'text',
+    text: `HTML:\n\`\`\`html\n${message.html || ''}\n\`\`\`\n\nCSS:\n\`\`\`css\n${message.css || ''}\n\`\`\`\n\nCandidate interactive elements (index: <tag> "text" attrs [selector]):\n${candList}\n\nReturn ONLY the JSON array.`,
+  });
+
+  const systemPrompt = `You are a UI interaction planner for a design-capture tool.
+You are given a captured UI component's HTML, CSS, a resting-state screenshot, and a numbered list of candidate interactive elements.
+Decide which candidates are worth interacting with to reveal hidden or dynamic UI (dropdown menus, tooltips, popovers, submenus, toggled content, injected badges).
+- SKIP elements unlikely to reveal anything new (plain navigation links, decorative icons, static text).
+- For each chosen candidate pick the single action most likely to reveal new UI: "hover", "focus", or "click". Use "click" ONLY for elements that clearly toggle/open content (menus, disclosure buttons) — never for links that navigate to another page.
+Return ONLY a JSON array, max 5 items, ordered by importance:
+[{"index": <number>, "action": "hover"|"focus"|"click", "reason": "<short>"}]
+If nothing is worth probing, return [].`;
+
+  const raw = await callLLM(systemPrompt, content, apiKey, provider);
+  return parsePlanArray(raw);
+}
+
+async function planReplanInteractions(message, apiKey, provider) {
+  const candList = (message.candidates || [])
+    .map((c) => `${c.index}: <${c.tag}> "${c.text}" ${(c.attrs || []).join(' ')} [${c.selector}]`)
+    .join('\n');
+  const history = (message.history || [])
+    .map((h) => `- ${h.trigger}${h.added && h.added.length ? ` revealed: ${h.added.join(', ')}` : ''}`)
+    .join('\n');
+
+  const systemPrompt = `You are a UI interaction planner exploring nested UI.
+The element \`${message.parent || 'a trigger'}\` was activated and revealed new interactive elements (listed below).
+Choose up to 2 follow-up actions to reveal DEEPER nested UI (e.g. a submenu/flyout inside the opened menu, a tooltip on a revealed item).
+Only pick elements likely to reveal something further; otherwise return [].
+Return ONLY a JSON array referring to the NEW candidate list:
+[{"index": <number>, "action": "hover"|"focus"|"click", "reason": "<short>"}]`;
+
+  const userText = `Actions already performed:\n${history || '(none)'}\n\nNewly revealed interactive elements (index: <tag> "text" attrs [selector]):\n${candList}\n\nReturn ONLY the JSON array.`;
+  const raw = await callLLM(systemPrompt, userText, apiKey, provider);
+  return parsePlanArray(raw).slice(0, 2);
+}
+
+async function computeProbePlan(message) {
+  const provider = await getAiProvider();
+  const apiKey = provider === 'gemini' ? await getGeminiApiKey() : await getClaudeApiKey();
+  if (!apiKey) return null; // no key → content.js falls back to the heuristic sweep
+  if (message.phase === 'replan') return planReplanInteractions(message, apiKey, provider);
+  return planInitialInteractions(message, apiKey, provider);
+}
+
+function buildInteractionSpec(interactions) {
+  if (!interactions || !interactions.length) return '';
+  let spec = `\n\n**Observed interaction states (captured automatically by hovering the component's interactive parts — treat these as GROUND TRUTH and reproduce them faithfully):**\n`;
+  interactions.forEach((s, i) => {
+    spec += `\nState ${i + 1} — triggered by hovering/focusing \`${s.trigger || 'element'}\`:\n`;
+    const attrs = s.attrChanges || [];
+    const added = s.addedNodes || [];
+    if (attrs.length) {
+      spec += attrs.map(a => `  - attribute \`${a.attr}\` on \`${a.selector}\` became \`${a.value}\``).join('\n') + '\n';
+    }
+    if (added.length) {
+      spec += added.map(n => `  - a new element \`${n.selector}\` appeared:\n\`\`\`html\n${n.html}\n\`\`\``).join('\n') + '\n';
+    }
+    if (!attrs.length && !added.length) {
+      spec += `  - a visual change occurred (no DOM mutation) — see the accompanying screenshot for this state\n`;
+    }
+  });
+  return spec;
+}
+
+async function reconstructComponent(component, screenshotDataUrl, apiKey, provider, interactions = []) {
+  const interactionSpec = buildInteractionSpec(interactions);
+
   const content = [
     {
       type: 'text',
@@ -294,22 +395,33 @@ ${component.html}
 \`\`\`css
 ${component.css}
 \`\`\`
+${interactionSpec}
 
 Provide a single self-contained HTML file. Ensure:
-- The design matches the HTML/CSS and the screenshot (if provided) exactly.
-- Common interactive behaviors (such as tooltips, dropdowns, accordions, toggles) are fully functional and visually refined.
+- The design matches the HTML/CSS and the screenshots (resting state + any interaction states) exactly.
+- Every observed interaction state above is fully reproduced: the elements that appear on hover/focus (dropdowns, tooltips, popovers, injected badges) must be implemented and shown on the same trigger, even if their markup was NOT present in the original HTML (it may have been rendered dynamically).
+- Common interactive behaviors are fully functional, visually refined, and keyboard-accessible.
 - Output ONLY the raw HTML code. Do NOT wrap the response in markdown code blocks (\`\`\`), and provide no extra explanation.`
     }
   ];
 
-  // Attach screenshot if available
+  // Attach interaction-state screenshots (revealed states) first, labeled
+  (interactions || []).forEach((s, i) => {
+    if (!s.screenshot) return;
+    const base64 = s.screenshot.split(',')[1];
+    if (!base64) return;
+    content.push({ type: 'text', text: `Interaction state ${i + 1} — after hovering \`${s.trigger || 'element'}\`:` });
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } });
+  });
+
+  // Attach the resting-state screenshot if available
   if (screenshotDataUrl) {
     const base64 = screenshotDataUrl.split(',')[1];
     content.unshift({
       type: 'image',
       source: { type: 'base64', media_type: 'image/png', data: base64 }
     });
-    content.unshift({ type: 'text', text: 'Here is a screenshot of the component for visual reference:' });
+    content.unshift({ type: 'text', text: 'Here is a screenshot of the component in its resting state:' });
   }
 
   const systemPrompt = `You are a world-class senior frontend engineer and UI designer specializing in component reconstruction.
@@ -321,7 +433,8 @@ Follow these strict design and coding principles:
    - Hover effects (scale, opacity, color shifts, transitions).
    - Focus rings for accessibility.
    - Active/click press feedback.
-3. COMMON INTERACTION INFERENCE:
+3. OBSERVED INTERACTION STATES (HIGHEST PRIORITY): If the prompt includes "Observed interaction states", these were captured live by hovering the component and are GROUND TRUTH. Reproduce each one exactly — implement the dropdown/tooltip/popover/badge that appears, wired to the same trigger, with matching content and styling from the accompanying state screenshots. The revealed markup may have been absent from the original HTML (rendered dynamically); recreate it regardless.
+4. COMMON INTERACTION INFERENCE (when not directly observed above):
    - Tooltips: Look for attributes like 'title', 'data-tooltip', 'aria-label', 'aria-describedby', or placeholder classes. Construct a clean, animated tooltip positioned correctly relative to the target, visible on hover/focus.
    - Dropdowns & Popovers: If you see indicators like chevrons (▾), 'aria-haspopup', 'aria-expanded', or menu items, implement a fully interactive dropdown toggle with smooth opening/closing transitions.
    - Accordions & Tabs: Implement tab switching or accordion collapse/expand with smooth height transitions and ARIA attributes.
@@ -376,6 +489,7 @@ let currentExtractedData = null;
 let activeComponentId = null; // for modal
 let pendingComponent = null;  // picked but not yet saved
 let pendingScreenshot = null; // cropped dataUrl for pending component
+let pendingInteractions = []; // captured hover/interaction states for pending component
 
 // ─────────────────────────────────────────────
 // TAB NAVIGATION
@@ -631,6 +745,7 @@ function renderStyles(data) {
 function showComponentPreview(comp, screenshotDataUrl) {
   pendingComponent = comp;
   pendingScreenshot = screenshotDataUrl || null;
+  pendingInteractions = [];
 
   const panel = document.getElementById('component-preview-panel');
   panel.style.display = 'block';
@@ -647,15 +762,46 @@ function showComponentPreview(comp, screenshotDataUrl) {
     screenshotEl.innerHTML = `<div class="no-screenshot">No screenshot available</div>`;
   }
 
+  // Interaction states arrive a moment later via INTERACTION_STATES — show a probing state for now
+  renderPreviewInteractions('probing');
+
   // switchTab('components') already called renderComponents() before this
+}
+
+// Render the captured interaction states (or a probing/empty state) in the preview panel
+function renderPreviewInteractions(status) {
+  const el = document.getElementById('preview-interactions');
+  if (!el) return;
+
+  if (status === 'probing') {
+    el.style.display = 'block';
+    el.innerHTML = `<div class="interactions-label"><span class="spinner"></span> Probing interactions…</div>`;
+    return;
+  }
+  if (!pendingInteractions.length) {
+    el.style.display = 'block';
+    el.innerHTML = `<div class="interactions-label">No extra interaction states detected</div>`;
+    return;
+  }
+
+  el.style.display = 'block';
+  const thumbs = pendingInteractions.map((s, i) => {
+    const img = s.screenshot ? `<img src="${s.screenshot}" alt="state ${i + 1}" />` : '';
+    return `<div class="interaction-thumb" title="${(s.trigger || '').replace(/"/g, '&quot;')}">${img}<span>${s.trigger || `state ${i + 1}`}</span></div>`;
+  }).join('');
+  el.innerHTML = `<div class="interactions-label">⚡ ${pendingInteractions.length} interaction state(s) captured — will be sent to AI</div>
+    <div class="interaction-thumbs">${thumbs}</div>`;
 }
 
 function discardPreview() {
   pendingComponent = null;
   pendingScreenshot = null;
+  pendingInteractions = [];
   document.getElementById('component-preview-panel').style.display = 'none';
   document.getElementById('preview-error').style.display = 'none';
   document.getElementById('reconstruct-result').style.display = 'none';
+  const intEl = document.getElementById('preview-interactions');
+  if (intEl) { intEl.style.display = 'none'; intEl.innerHTML = ''; }
 }
 
 // Open an HTML string in a new tab as a standalone preview
@@ -665,10 +811,19 @@ function previewInTab(html) {
   chrome.tabs.create({ url });
 }
 
+// Strip the (large) screenshot dataUrls before persisting interaction specs
+function interactionSpecsForStorage() {
+  return pendingInteractions.map(s => ({
+    trigger: s.trigger || null,
+    addedNodes: s.addedNodes || [],
+    attrChanges: s.attrChanges || [],
+  }));
+}
+
 // Save the raw captured component (no AI)
 async function saveRawComponent() {
   if (!pendingComponent) return;
-  const comp = { ...pendingComponent, id: uid() };
+  const comp = { ...pendingComponent, id: uid(), interactions: interactionSpecsForStorage() };
   if (pendingScreenshot) {
     await dbPut('screenshots', { id: comp.id, dataUrl: pendingScreenshot });
   }
@@ -681,7 +836,7 @@ async function saveRawComponent() {
 // Save a reconstructed component (after AI)
 async function saveReconstructedComponent(reconstructedHtml) {
   if (!pendingComponent) return;
-  const comp = { ...pendingComponent, id: uid(), reconstructed: reconstructedHtml };
+  const comp = { ...pendingComponent, id: uid(), reconstructed: reconstructedHtml, interactions: interactionSpecsForStorage() };
   if (pendingScreenshot) {
     await dbPut('screenshots', { id: comp.id, dataUrl: pendingScreenshot });
   }
@@ -714,7 +869,7 @@ async function reconstructCurrentComponent() {
   btn.innerHTML = '<span class="spinner"></span> Reconstructing…';
 
   try {
-    const reconstructed = await reconstructComponent(pendingComponent, pendingScreenshot, apiKey, provider);
+    const reconstructed = await reconstructComponent(pendingComponent, pendingScreenshot, apiKey, provider, pendingInteractions);
 
     // Wire up result-panel buttons with the fresh HTML
     document.getElementById('btn-copy-reconstructed').onclick = () => copyText(reconstructed);
@@ -1254,6 +1409,7 @@ function resetUI() {
   // Components tab → reset preview + list
   pendingComponent = null;
   pendingScreenshot = null;
+  pendingInteractions = [];
   document.getElementById('component-preview-panel').style.display = 'none';
   document.getElementById('saved-components-header').style.display = 'none';
   document.getElementById('components-empty').style.display = 'flex';
@@ -1514,6 +1670,23 @@ ${pendingComponent.css}</style></head><body><div>${pendingComponent.html}</div><
     }
   });
 
+  // Dedicated request/response listener for the interaction planner. Kept
+  // separate from the async listener below so we can return true and respond
+  // asynchronously (Chrome doesn't support that from an async listener).
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== 'PROBE_PLAN') return; // other listener handles the rest
+    (async () => {
+      try {
+        const plan = await computeProbePlan(message);
+        sendResponse({ ok: !!plan, plan: plan || [] });
+      } catch (err) {
+        console.warn('[atomic-strip] plan failed:', err);
+        sendResponse({ ok: false, plan: [] });
+      }
+    })();
+    return true; // keep the channel open for the async sendResponse
+  });
+
   // Background messages (from content script / tab events)
   chrome.runtime.onMessage.addListener(async (message) => {
     switch (message.type) {
@@ -1544,6 +1717,18 @@ ${pendingComponent.css}</style></head><body><div>${pendingComponent.html}</div><
         switchTab('components');
         showComponentPreview(comp, croppedDataUrl);
         document.getElementById('picker-status').textContent = '';
+        break;
+      }
+
+      // Interaction probe finished in the page — attach revealed states to the
+      // pending component so "Reconstruct with AI" can include them.
+      case 'INTERACTION_STATES': {
+        if (!pendingComponent) break;
+        // Match the states to the component currently in preview (capturedAt === captureId)
+        if (message.captureId != null && pendingComponent.capturedAt != null &&
+            message.captureId !== pendingComponent.capturedAt) break;
+        pendingInteractions = Array.isArray(message.states) ? message.states : [];
+        renderPreviewInteractions('done');
         break;
       }
 

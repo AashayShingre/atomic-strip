@@ -7,6 +7,35 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 // Track which tab the side panel is observing
 let activeSidePanelTabId = null;
 
+// ─────────────────────────────────────────────
+// THROTTLED SCREENSHOT QUEUE
+// captureVisibleTab is rate-limited (~2 calls/sec). The interaction probe fires
+// several captures in a row, so all captures (baseline + probe states) go through
+// one serialized queue that spaces calls ≥700ms apart to avoid quota errors.
+// ─────────────────────────────────────────────
+let captureChain = Promise.resolve();
+let lastCaptureTs = 0;
+const MIN_CAPTURE_GAP_MS = 700;
+
+function queuedCapture(windowId) {
+  captureChain = captureChain.then(async () => {
+    const wait = Math.max(0, MIN_CAPTURE_GAP_MS - (Date.now() - lastCaptureTs));
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    return new Promise((resolve) => {
+      chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, (dataUrl) => {
+        lastCaptureTs = Date.now();
+        if (chrome.runtime.lastError) {
+          console.warn('[atomic-strip] captureVisibleTab failed:', chrome.runtime.lastError.message);
+          resolve(null);
+        } else {
+          resolve(dataUrl || null);
+        }
+      });
+    });
+  });
+  return captureChain;
+}
+
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   activeSidePanelTabId = tabId;
   // Notify the side panel that the active tab changed
@@ -59,19 +88,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         // Wait one repaint cycle so the picker overlay is visually gone before capturing
         setTimeout(() => {
-          chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }, (dataUrl) => {
-            if (chrome.runtime.lastError) {
-              console.warn('[atomic-strip] captureVisibleTab failed:', chrome.runtime.lastError.message);
-            }
+          queuedCapture(tab.windowId).then((dataUrl) => {
             chrome.runtime.sendMessage({
               ...message,
               _forwarded: true,
-              screenshotDataUrl: chrome.runtime.lastError ? null : (dataUrl || null)
+              screenshotDataUrl: dataUrl
             }).catch(() => {});
           });
         }, 120);
       });
       break;
+    }
+
+    // Interaction probe (content.js) requests an on-demand screenshot of the
+    // visible tab for each hover state. Serialized + throttled via queuedCapture.
+    case 'CAPTURE_VISIBLE': {
+      const windowId = sender.tab?.windowId;
+      if (windowId == null) {
+        sendResponse({ dataUrl: null });
+        break;
+      }
+      queuedCapture(windowId).then((dataUrl) => sendResponse({ dataUrl }));
+      return true; // keep the message channel open for the async sendResponse
     }
   }
 });

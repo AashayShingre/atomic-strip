@@ -437,7 +437,465 @@
     return matchedRules.join('\n');
   }
 
-  function captureElement(el) {
+  // ─────────────────────────────────────────────
+  // INTERACTION PROBE  (primitive agentic flow)
+  // After capturing the resting element, "drive" its interactive parts: move a
+  // visible cursor over each, fire synthetic hover/focus, and force the matching
+  // CSS :hover rules (synthetic events alone can't trigger native :hover). A
+  // MutationObserver records DOM that appears (dropdowns, tooltips, injected
+  // nodes — incl. those portaled to <body>) and we screenshot each revealed
+  // state. All states are sent to the side panel to feed "Generate with AI".
+  // ─────────────────────────────────────────────
+
+  const PROBE_MAX = 5;        // cap how many interactive parts we exercise
+  const PROBE_SETTLE_MS = 340; // wait for transitions / JS after hover
+  const PROBE_RESET_MS = 180;  // wait after un-hover before the next probe
+  const FORCE_STATE_CLASS = '__as_force_state__';
+  const STATE_PSEUDO = /:(hover|focus|focus-visible|focus-within|active)\b/g;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function stripPseudo(selectorText) {
+    return selectorText
+      .split(',')
+      .map((s) => s
+        .replace(/::[\w-]+(\([^)]*\))?/g, '')
+        .replace(/:[\w-]+(\([^)]*\))?/g, '')
+        .trim())
+      .filter(Boolean)
+      .join(',');
+  }
+
+  function describeEl(el) {
+    if (!el || el.nodeType !== 1) return '';
+    const tag = el.tagName.toLowerCase();
+    const id = el.id ? `#${el.id}` : '';
+    const cls = [...el.classList].slice(0, 2).map((c) => `.${c}`).join('');
+    const di = el.getAttribute && el.getAttribute('data-interaction');
+    return `${tag}${id}${cls}${di ? `[data-interaction=${di}]` : ''}`;
+  }
+
+  function isVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  function ancestorsOf(el) {
+    const out = [];
+    let p = el.parentElement;
+    while (p && p !== document.documentElement) { out.push(p); p = p.parentElement; }
+    return out;
+  }
+
+  // Temporarily re-apply matching :hover/:focus rules unconditionally so pure-CSS
+  // reveals become visible for the screenshot. Returns a cleanup function.
+  function applyForcedHover(el) {
+    const chain = [el, ...el.querySelectorAll('*'), ...ancestorsOf(el)];
+    const forced = [];
+    const seen = new Set();
+    try {
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try { rules = sheet.cssRules; } catch { continue; }
+        for (const rule of rules) {
+          if (rule.type !== CSSRule.STYLE_RULE) continue;
+          STATE_PSEUDO.lastIndex = 0;
+          if (!STATE_PSEUDO.test(rule.selectorText)) continue;
+          const base = stripPseudo(rule.selectorText);
+          if (!base) continue;
+          let relevant = false;
+          try { relevant = chain.some((e) => e.matches(base)); } catch {}
+          if (!relevant) continue;
+          const forcedSelector = rule.selectorText
+            .replace(STATE_PSEUDO, '')
+            .split(',')
+            .map((s) => `.${FORCE_STATE_CLASS} ${s.trim()}`)
+            .join(',');
+          const text = `${forcedSelector}{${rule.style.cssText}}`;
+          if (!seen.has(text)) { seen.add(text); forced.push(text); }
+        }
+      }
+    } catch {}
+
+    if (!forced.length) return () => {};
+    const styleEl = document.createElement('style');
+    styleEl.textContent = forced.join('\n');
+    document.head.appendChild(styleEl);
+    document.documentElement.classList.add(FORCE_STATE_CLASS);
+    return () => {
+      styleEl.remove();
+      document.documentElement.classList.remove(FORCE_STATE_CLASS);
+    };
+  }
+
+  function fireMouse(el, type, x, y) {
+    const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+    el.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+  }
+  function dispatchHover(el) {
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove'].forEach((t) => fireMouse(el, t, x, y));
+    if (typeof el.focus === 'function') { try { el.focus({ preventScroll: true }); } catch {} }
+  }
+  function dispatchUnhover(el) {
+    ['mousemove', 'mouseout', 'mouseleave', 'pointerout', 'pointerleave'].forEach((t) => fireMouse(el, t));
+    if (typeof el.blur === 'function') { try { el.blur(); } catch {} }
+  }
+
+  // Ask the background worker for a throttled screenshot of the visible tab.
+  function requestScreenshot() {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'CAPTURE_VISIBLE' }, (resp) => {
+          if (chrome.runtime.lastError) { resolve(null); return; }
+          resolve(resp?.dataUrl || null);
+        });
+      } catch { resolve(null); }
+    });
+  }
+
+  // Crop a full-tab screenshot to a viewport-space rect, in page context.
+  function cropInPage(dataUrl, rect, dpr) {
+    return new Promise((resolve) => {
+      if (!dataUrl) { resolve(null); return; }
+      const img = new Image();
+      img.onload = () => {
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(rect.width * dpr));
+        c.height = Math.max(1, Math.round(rect.height * dpr));
+        try {
+          c.getContext('2d').drawImage(
+            img, rect.left * dpr, rect.top * dpr, rect.width * dpr, rect.height * dpr,
+            0, 0, c.width, c.height
+          );
+          resolve(c.toDataURL('image/png'));
+        } catch { resolve(null); }
+      };
+      img.onerror = () => resolve(null);
+      img.src = dataUrl;
+    });
+  }
+
+  // Bounding box of root + every currently-visible descendant + any added nodes
+  // (so absolutely-positioned dropdowns / portaled tooltips aren't clipped),
+  // clamped to the viewport and padded.
+  function probeUnionRect(root, addedEls) {
+    const rects = [root.getBoundingClientRect()];
+    root.querySelectorAll('*').forEach((e) => { if (isVisible(e)) rects.push(e.getBoundingClientRect()); });
+    addedEls.forEach((e) => { if (isVisible(e)) rects.push(e.getBoundingClientRect()); });
+    let top = Infinity, left = Infinity, right = -Infinity, bottom = -Infinity;
+    rects.forEach((r) => {
+      top = Math.min(top, r.top); left = Math.min(left, r.left);
+      right = Math.max(right, r.right); bottom = Math.max(bottom, r.bottom);
+    });
+    const PAD = 12;
+    top = Math.max(0, top - PAD);
+    left = Math.max(0, left - PAD);
+    right = Math.min(window.innerWidth, right + PAD);
+    bottom = Math.min(window.innerHeight, bottom + PAD);
+    return { top, left, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+  }
+
+  function findCandidates(root) {
+    const sel = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[title],[tabindex],[data-interaction]';
+    let list = [root, ...root.querySelectorAll(sel)];
+    root.querySelectorAll('*').forEach((e) => { if (getComputedStyle(e).cursor === 'pointer') list.push(e); });
+    list = [...new Set(list)];
+    const score = (e) => {
+      let s = 0;
+      if (e === root) s += 5;
+      if (e.hasAttribute && e.hasAttribute('data-interaction')) s += 4;
+      try { if (e.matches('[aria-haspopup],[aria-expanded],[data-tooltip]')) s += 3; } catch {}
+      try { if (e.matches('button,a,[role="button"]')) s += 1; } catch {}
+      return -s;
+    };
+    list.sort((a, b) => score(a) - score(b));
+    return list.slice(0, PROBE_MAX);
+  }
+
+  function summarizeMutations(mutations) {
+    const addedNodes = [], addedEls = [], attrChanges = [];
+    const seenAttr = new Set();
+    for (const m of mutations) {
+      if (m.type === 'childList') {
+        m.addedNodes.forEach((n) => {
+          if (n.nodeType === 1 && isVisible(n)) {
+            addedEls.push(n);
+            addedNodes.push({ selector: describeEl(n), html: (n.outerHTML || '').slice(0, 1500) });
+          }
+        });
+      } else if (m.type === 'attributes') {
+        const value = m.target.getAttribute(m.attributeName);
+        const sig = `${describeEl(m.target)}|${m.attributeName}=${value}`;
+        if (!seenAttr.has(sig)) {
+          seenAttr.add(sig);
+          attrChanges.push({ selector: describeEl(m.target), attr: m.attributeName, value });
+        }
+      }
+    }
+    return { addedNodes, addedEls, attrChanges };
+  }
+
+  // Visible cursor that animates to each probed element ("watch the agent move").
+  let probeCursor = null;
+  function showCursor() {
+    probeCursor = document.createElement('div');
+    Object.assign(probeCursor.style, {
+      position: 'fixed', width: '18px', height: '18px', left: '0', top: '0',
+      borderRadius: '50%', background: 'rgba(123,104,238,0.85)',
+      boxShadow: '0 0 0 4px rgba(123,104,238,0.25)', zIndex: '2147483647',
+      pointerEvents: 'none', transition: 'transform 0.25s ease', transform: 'translate(-50%,-50%)',
+    });
+    document.body.appendChild(probeCursor);
+  }
+  function moveCursorTo(el) {
+    if (!probeCursor) return;
+    const r = el.getBoundingClientRect();
+    probeCursor.style.transform = `translate(${r.left + r.width / 2}px, ${r.top + r.height / 2}px) translate(-50%,-50%)`;
+  }
+  function hideCursor() { probeCursor?.remove(); probeCursor = null; }
+
+  const INTERACTIVE_SEL = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[title],[tabindex],[data-interaction]';
+  const PLAN_TIMEOUT_MS = 25000;
+
+  // Perform a single action on an element. Returns a cleanup fn that reverses it.
+  function performAction(el, action) {
+    const undoForce = applyForcedHover(el);
+    if (action === 'focus') {
+      try { el.focus({ preventScroll: true }); } catch {}
+      return () => { try { el.blur(); } catch {} undoForce(); };
+    }
+    if (action === 'click') {
+      // Neutralize navigation/submit so JS handlers still run but the page doesn't leave.
+      const prevent = (e) => e.preventDefault();
+      document.addEventListener('click', prevent, { capture: true });
+      dispatchHover(el);
+      try { el.click(); } catch {}
+      document.removeEventListener('click', prevent, { capture: true });
+      return () => {
+        // Toggle back (most click-opened menus close on a second click)
+        const p2 = (e) => e.preventDefault();
+        document.addEventListener('click', p2, { capture: true });
+        try { el.click(); } catch {}
+        document.removeEventListener('click', p2, { capture: true });
+        dispatchUnhover(el);
+        undoForce();
+      };
+    }
+    // default: hover
+    dispatchHover(el);
+    return () => { dispatchUnhover(el); undoForce(); };
+  }
+
+  // Run a single planned action from the resting state, capturing the result.
+  async function probeAction(root, el, action) {
+    const mutations = [];
+    const obs = new MutationObserver((m) => mutations.push(...m));
+    obs.observe(document.body, {
+      subtree: true, childList: true, attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'open', 'aria-expanded', 'aria-hidden', 'data-state'],
+    });
+
+    moveCursorTo(el);
+    await sleep(120); // let the cursor glide
+    const undo = performAction(el, action);
+    await sleep(PROBE_SETTLE_MS);
+    obs.disconnect();
+
+    const summary = summarizeMutations(mutations);
+    const rect = probeUnionRect(root, [...summary.addedEls, el]);
+    const dpr = window.devicePixelRatio || 1;
+    const full = await requestScreenshot();
+    const screenshot = await cropInPage(full, rect, dpr);
+
+    undo();
+    await sleep(PROBE_RESET_MS);
+
+    return {
+      label: `${action} ${describeEl(el)}`,
+      trigger: describeEl(el),
+      action,
+      addedNodes: summary.addedNodes,
+      addedEls: summary.addedEls,
+      attrChanges: summary.attrChanges,
+      screenshot,
+    };
+  }
+
+  // Capture a nested step: parent is already open; act on a revealed child.
+  async function probeChildOpen(root, parentEl, childEl, action) {
+    const mutations = [];
+    const obs = new MutationObserver((m) => mutations.push(...m));
+    obs.observe(document.body, {
+      subtree: true, childList: true, attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'open', 'aria-expanded', 'aria-hidden', 'data-state'],
+    });
+
+    moveCursorTo(childEl);
+    await sleep(120);
+    const undo = performAction(childEl, action);
+    await sleep(PROBE_SETTLE_MS);
+    obs.disconnect();
+
+    const summary = summarizeMutations(mutations);
+    const rect = probeUnionRect(root, [...summary.addedEls, parentEl, childEl]);
+    const dpr = window.devicePixelRatio || 1;
+    const full = await requestScreenshot();
+    const screenshot = await cropInPage(full, rect, dpr);
+
+    undo();
+    await sleep(PROBE_RESET_MS);
+
+    return {
+      label: `${describeEl(parentEl)} → ${action} ${describeEl(childEl)}`,
+      trigger: `${describeEl(parentEl)} → ${describeEl(childEl)}`,
+      action,
+      addedNodes: summary.addedNodes,
+      attrChanges: summary.attrChanges,
+      screenshot,
+    };
+  }
+
+  // Open a parent (hover, no reset) and return a cleanup fn.
+  async function openState(parentEl) {
+    const undoForce = applyForcedHover(parentEl);
+    dispatchHover(parentEl);
+    await sleep(PROBE_SETTLE_MS);
+    return () => { dispatchUnhover(parentEl); undoForce(); };
+  }
+
+  function currentInteractive() {
+    const set = new Set();
+    document.querySelectorAll(INTERACTIVE_SEL).forEach((e) => { if (isVisible(e)) set.add(e); });
+    return set;
+  }
+
+  function candidateInfo(el, i) {
+    const attrs = [];
+    ['role', 'aria-haspopup', 'aria-expanded', 'data-tooltip', 'title', 'href'].forEach((a) => {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v) attrs.push(`${a}="${String(v).slice(0, 40)}"`);
+    });
+    return {
+      index: i,
+      selector: describeEl(el),
+      tag: el.tagName.toLowerCase(),
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 50),
+      attrs,
+    };
+  }
+
+  async function captureComponentShot(root) {
+    const rect = probeUnionRect(root, []);
+    const full = await requestScreenshot();
+    return cropInPage(full, rect, window.devicePixelRatio || 1);
+  }
+
+  // Ask the side panel (which holds the LLM API key) for an action plan.
+  // Resolves to an array of {index, action} or null (→ caller falls back).
+  function requestPlan(payload) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      const timer = setTimeout(() => finish(null), PLAN_TIMEOUT_MS);
+      try {
+        chrome.runtime.sendMessage({ type: 'PROBE_PLAN', ...payload }, (resp) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) { finish(null); return; }
+          finish(resp && resp.ok && Array.isArray(resp.plan) ? resp.plan : null);
+        });
+      } catch { clearTimeout(timer); finish(null); }
+    });
+  }
+
+  // Hybrid agentic probe: LLM plans → deterministic execution → one re-plan
+  // round for nested depth. Falls back to a heuristic sweep if no plan is
+  // available (side panel closed, no API key, planner error, or timeout).
+  async function runInteractionProbe(root, captureId) {
+    showCursor();
+    const states = [];
+    try {
+      const candidates = findCandidates(root);
+      const baselineVisible = currentInteractive();
+      const componentShot = await captureComponentShot(root);
+
+      const plan = await requestPlan({
+        phase: 'initial',
+        captureId,
+        html: root.outerHTML.slice(0, 6000),
+        css: getRelevantCSS(root).slice(0, 4000),
+        screenshot: componentShot,
+        candidates: candidates.map(candidateInfo),
+      });
+
+      // LLM plan (efficient) or heuristic fallback (probe each candidate w/ hover)
+      const planned = (plan && plan.length)
+        ? plan.filter((a) => candidates[a.index]).map((a) => ({ el: candidates[a.index], action: a.action || 'hover' }))
+        : candidates.map((el) => ({ el, action: 'hover' }));
+
+      const expandable = [];
+      for (const step of planned) {
+        try {
+          const state = await probeAction(root, step.el, step.action);
+          if (state.screenshot) states.push(state);
+          if (state.addedNodes && state.addedNodes.length) expandable.push(step.el);
+        } catch (err) {
+          console.warn('[atomic-strip] action failed:', err);
+        }
+      }
+
+      // One re-plan round (only when an actual planner is in play) to explore
+      // UI revealed by the first pass — e.g. a submenu inside an opened menu.
+      if (plan && expandable.length) {
+        const parentEl = expandable[0];
+        const undoParent = await openState(parentEl);
+        try {
+          const revealed = [];
+          document.querySelectorAll(INTERACTIVE_SEL).forEach((e) => {
+            if (isVisible(e) && !baselineVisible.has(e)) revealed.push(e);
+          });
+          if (revealed.length) {
+            const childPlan = await requestPlan({
+              phase: 'replan',
+              captureId,
+              parent: describeEl(parentEl),
+              candidates: revealed.slice(0, 12).map(candidateInfo),
+              history: states.map((s) => ({ trigger: s.trigger, added: s.addedNodes.map((n) => n.selector) })),
+            });
+            for (const a of (childPlan || []).slice(0, 2)) {
+              const child = revealed[a.index];
+              if (!child) continue;
+              try {
+                const state = await probeChildOpen(root, parentEl, child, a.action || 'hover');
+                if (state.screenshot) states.push(state);
+              } catch (err) {
+                console.warn('[atomic-strip] nested action failed:', err);
+              }
+            }
+          }
+        } finally {
+          undoParent();
+          await sleep(PROBE_RESET_MS);
+        }
+      }
+    } finally {
+      hideCursor();
+      document.documentElement.classList.remove(FORCE_STATE_CLASS);
+    }
+
+    // Strip live element refs (addedEls) before sending across contexts
+    const clean = states.map((s) => ({
+      label: s.label, trigger: s.trigger, action: s.action,
+      addedNodes: s.addedNodes, attrChanges: s.attrChanges, screenshot: s.screenshot,
+    }));
+    chrome.runtime.sendMessage({ type: 'INTERACTION_STATES', captureId, states: clean }).catch(() => {});
+  }
+
+  async function captureElement(el) {
     if (!el) return;
 
     const rect = el.getBoundingClientRect();
@@ -464,6 +922,7 @@
     else if (classes.includes('modal') || classes.includes('dialog')) category = 'modal';
     else if (classes.includes('form') || tag === 'form') category = 'form';
 
+    const captureId = Date.now();
     const data = {
       html,
       css,
@@ -473,11 +932,14 @@
       fontFamilies: [...fontFamilies],
       url: location.href,
       domain: location.hostname,
-      capturedAt: Date.now(),
+      capturedAt: captureId,
       devicePixelRatio: window.devicePixelRatio || 1
     };
 
+    // Send the resting capture immediately (background attaches the baseline
+    // screenshot), then run the interaction probe and stream states afterward.
     chrome.runtime.sendMessage({ type: 'ELEMENT_CAPTURED', data });
+    runInteractionProbe(el, captureId);
   }
 
   function startPicker() {
