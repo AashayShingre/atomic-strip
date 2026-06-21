@@ -543,6 +543,7 @@
 
     if (!forced.length) return () => {};
     const styleEl = document.createElement('style');
+    styleEl.dataset.asForce = '1'; // so the probe ignores its own injected style
     styleEl.textContent = forced.join('\n');
     document.head.appendChild(styleEl);
     document.documentElement.classList.add(FORCE_STATE_CLASS);
@@ -731,13 +732,30 @@
     try { return [...n.querySelectorAll('*')].some(isVisible); } catch { return false; }
   }
 
+  // True for mutations the probe itself causes — the moving cursor overlay and
+  // the forced-hover gating class on <html>. These must NOT count as reveals,
+  // or every probe registers a phantom DOM change and nothing gets filtered.
+  function isSelfMutation(m) {
+    if (m.target === probeCursor) return true; // cursor's style.transform updates
+    if (m.target === document.documentElement && m.attributeName === 'class') {
+      const v = m.target.getAttribute('class') || '';
+      if (v.includes(FORCE_STATE_CLASS)) return true; // forced-hover toggle
+    }
+    return false;
+  }
+
+  function isSelfNode(n) {
+    return n === probeCursor || (n.nodeType === 1 && n.tagName === 'STYLE' && n.dataset && n.dataset.asForce === '1');
+  }
+
   function summarizeMutations(mutations) {
     const addedNodes = [], addedEls = [], attrChanges = [];
     const seenAttr = new Set();
     for (const m of mutations) {
+      if (isSelfMutation(m)) continue;
       if (m.type === 'childList') {
         m.addedNodes.forEach((n) => {
-          if (n.nodeType === 1 && anyVisible(n)) {
+          if (n.nodeType === 1 && !isSelfNode(n) && anyVisible(n)) {
             addedEls.push(n);
             addedNodes.push({ selector: describeEl(n), html: (n.outerHTML || '').slice(0, 1500) });
           }

@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>probe test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; font-family: system-ui, sans-serif; }
+  #target { position: relative; margin: 60px; padding: 24px; border: 1px solid #ddd; border-radius: 8px; display: flex; gap: 16px; }
+
+  /* (A) pure CSS hover recolor — should be FILTERED (in-place, no new UI) */
+  .recolor { padding: 8px 14px; background: #eee; border: 0; border-radius: 6px; cursor: pointer; }
+  .recolor:hover { background: #7B68EE; color: #fff; }
+
+  /* (C) pure CSS tooltip that appears OUTSIDE the trigger — should be CAPTURED */
+  .css-tip { position: relative; padding: 8px 14px; background: #f4f4f4; border-radius: 6px; cursor: pointer; }
+  .css-tip .tip { position: absolute; left: 0; top: 120%; white-space: nowrap; background: #111; color: #fff;
+                  padding: 6px 10px; border-radius: 6px; opacity: 0; pointer-events: none; }
+  .css-tip:hover .tip { opacity: 1; }
+</style>
+</head>
+<body>
+  <div id="target">
+    <button class="recolor">Recolor only</button>
+    <a href="#" class="js-pop" data-hovercard-url="/x">JS hovercard</a>
+    <span class="css-tip">CSS tooltip<span class="tip">I am a CSS tooltip</span></span>
+  </div>
+
+  <script src="../vendor/html2canvas.min.js"></script>
+  <script>
+    // ── (B) JS-injected popover portaled to <body>, positioned outside trigger ──
+    const pop = document.querySelector('.js-pop');
+    let card = null;
+    pop.addEventListener('mouseover', () => {
+      if (card) return;
+      card = document.createElement('div');
+      card.className = 'js-hovercard';
+      Object.assign(card.style, {
+        position: 'absolute', left: '40px', top: '220px', width: '260px', height: '90px',
+        background: '#fff', boxShadow: '0 8px 30px rgba(0,0,0,.25)', border: '1px solid #ccc',
+        borderRadius: '8px', padding: '12px', zIndex: 100,
+      });
+      card.textContent = 'Hovercard fetched & shown (injected node, off-element)';
+      document.body.appendChild(card);
+    });
+    pop.addEventListener('mouseout', () => { card?.remove(); card = null; });
+  </script>
+
+  <script>
+    // ── chrome shim: CAPTURE_VISIBLE → html2canvas of the visible viewport ──
+    const listeners = [];
+    let capturing = false;
+    window.chrome = {
+      runtime: {
+        lastError: null,
+        sendMessage(msg, cb) {
+          if (msg && msg.type === 'CAPTURE_VISIBLE') {
+            capturing = true;
+            html2canvas(document.documentElement, {
+              x: window.scrollX, y: window.scrollY,
+              width: window.innerWidth, height: window.innerHeight,
+              scale: window.devicePixelRatio || 1, logging: false, backgroundColor: '#ffffff',
+            }).then((canvas) => {
+              capturing = false;
+              const dataUrl = canvas.toDataURL('image/png');
+              if (cb) cb({ dataUrl });
+            }).catch((e) => {
+              capturing = false;
+              console.error('[harness] html2canvas failed', e);
+              if (cb) cb({ dataUrl: null });
+            });
+            return;
+          }
+          // CONTENT_READY etc.
+          if (cb) cb({ ok: true });
+          return Promise.resolve({ ok: true });
+        },
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+      },
+      scripting: {},
+    };
+    window.__dispatch = (message) => new Promise((resolve) => {
+      let answered = false;
+      const sendResponse = (r) => { answered = true; resolve(r); };
+      for (const fn of listeners) {
+        const keepOpen = fn(message, {}, sendResponse);
+        if (keepOpen === true) return; // async sendResponse
+      }
+      if (!answered) resolve(undefined);
+    });
+  </script>
+  <script src="../content.js"></script>
+  <script>
+    // Kick off the probe once everything is loaded, log the result.
+    window.runProbeTest = async () => {
+      const t = document.getElementById('target');
+      const r = t.getBoundingClientRect();
+      const msg = {
+        type: 'REPROBE',
+        captureId: 'test-1',
+        selector: '#target',
+        rect: { top: r.top, left: r.left, width: r.width, height: r.height },
+      };
+      console.log('[harness] dispatching REPROBE');
+      const resp = await window.__dispatch(msg);
+      console.log('[harness] RESULT ok=', resp && resp.ok, 'states=', resp && resp.states && resp.states.length);
+      (resp && resp.states || []).forEach((s, i) => {
+        console.log(`[harness] state ${i}: trigger=${s.trigger} action=${s.action} addedNodes=${(s.addedNodes||[]).length} attr=${(s.attrChanges||[]).length} screenshot=${s.screenshot ? 'YES('+s.screenshot.length+'b)' : 'NULL'}`);
+      });
+      window.__probeDone = { ok: resp && resp.ok, count: resp && resp.states ? resp.states.length : 0,
+        states: (resp && resp.states || []).map(s => ({ trigger: s.trigger, hasShot: !!s.screenshot, added: (s.addedNodes||[]).length })) };
+      return window.__probeDone;
+    };
+  </script>
+</body>
+</html>

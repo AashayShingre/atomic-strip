@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "probe-test",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["test/server.js"],
+      "port": 8731
+    }
+  ]
+}
