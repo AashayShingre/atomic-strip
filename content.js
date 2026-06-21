@@ -568,6 +568,32 @@
     if (typeof el.blur === 'function') { try { el.blur(); } catch {} }
   }
 
+  // Many JS-driven reveals (e.g. GitHub hovercards) are guarded by a native
+  // :hover that synthetic events can't fake — but they expose a keyboard trigger
+  // via `aria-keyshortcuts` (e.g. "Alt+ArrowUp"). Focus the element and fire that
+  // combo so the reveal opens without a real pointer. No-op if not present.
+  function dispatchKeyShortcut(el) {
+    const ks = el.getAttribute && el.getAttribute('aria-keyshortcuts');
+    if (!ks) return;
+    const combo = ks.split(/\s+/)[0];           // first declared shortcut
+    const parts = combo.split('+').map((p) => p.trim()).filter(Boolean);
+    if (!parts.length) return;
+    const key = parts[parts.length - 1];
+    const mods = parts.slice(0, -1).map((m) => m.toLowerCase());
+    const init = {
+      bubbles: true, cancelable: true, key,
+      altKey: mods.includes('alt'),
+      ctrlKey: mods.includes('control') || mods.includes('ctrl'),
+      metaKey: mods.includes('meta') || mods.includes('cmd') || mods.includes('command'),
+      shiftKey: mods.includes('shift'),
+    };
+    try { el.focus({ preventScroll: true }); } catch {}
+    try {
+      el.dispatchEvent(new KeyboardEvent('keydown', init));
+      el.dispatchEvent(new KeyboardEvent('keyup', init));
+    } catch {}
+  }
+
   // Ask the background worker for a throttled screenshot of the visible tab.
   function requestScreenshotOnce() {
     return new Promise((resolve) => {
@@ -837,8 +863,10 @@
         undoForce();
       };
     }
-    // default: hover
+    // default: hover. Also fire any declared keyboard shortcut (aria-keyshortcuts)
+    // so reveals guarded by a native :hover (e.g. GitHub hovercards) still open.
     dispatchHover(el);
+    dispatchKeyShortcut(el);
     return () => { dispatchUnhover(el); undoForce(); };
   }
 

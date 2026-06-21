@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>github hovercard probe test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; font: 14px -apple-system, system-ui, sans-serif; }
+  #target { position: relative; margin: 60px; padding: 8px 12px; border: 1px solid #d0d7de; border-radius: 6px;
+            display: flex; gap: 8px; align-items: center; width: 520px; }
+  a { color: #1f2328; text-decoration: none; }
+  a:hover { color: #0969da; text-decoration: underline; }
+  .commit-msg { color: #636c76; }
+
+  /* GitHub's singleton hovercard popover — present at load, hidden. */
+  .Popover.js-hovercard-content { position: absolute; display: none; z-index: 100; }
+  .Popover-message { width: 360px; background: #fff; border: 1px solid #d0d7de; border-radius: 12px;
+                     box-shadow: 0 8px 24px rgba(66,74,83,.2); padding: 16px; }
+</style>
+</head>
+<body>
+  <div id="target">
+    <a href="/AashayShingre" class="author-link" data-hovercard-url="/users/AashayShingre/hovercard" data-hovercard-type="user" aria-keyshortcuts="Alt+ArrowUp">AashayShingre</a>
+    <a href="/commit/abc123" class="commit-msg" data-hovercard-url="/commit/abc123/hovercard" data-hovercard-type="commit" aria-keyshortcuts="Alt+ArrowUp">captureOnce</a>
+    <span class="commit-sha">abc123</span>
+  </div>
+
+  <!-- GitHub keeps a single, reusable, initially-hidden hovercard popover in the DOM -->
+  <div class="Popover js-hovercard-content" role="region" aria-label="Hovercard" style="display:none; position:absolute;">
+    <div class="Popover-message Popover-message--large"></div>
+  </div>
+
+  <script src="../vendor/html2canvas.min.js"></script>
+  <script>
+    // ── Faithful GitHub hovercard behavior ──
+    // delegated mouseover/focus on [data-hovercard-url] → delay → async "fetch" →
+    // populate the singleton popover, position it, show it. The delayed show is
+    // GUARDED by a real :hover (or focus) check, exactly like GitHub's, so a
+    // synthetic mouseover that doesn't create native :hover won't open it.
+    const HOVER_DELAY = 250;
+    const FETCH_MS = 200;
+    const pop = document.querySelector('.js-hovercard-content');
+    const msg = pop.querySelector('.Popover-message');
+    let timer = null, focusedEl = null;
+
+    function tryOpen(el, viaFocus) {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        // THE GUARD: only proceed if the trigger is genuinely hovered or focused.
+        const stillThere = viaFocus ? (document.activeElement === el) : el.matches(':hover');
+        if (!stillThere) return; // synthetic hover fails here
+        await new Promise(r => setTimeout(r, FETCH_MS)); // simulate network fetch
+        const kind = el.getAttribute('data-hovercard-type');
+        msg.innerHTML = kind === 'commit'
+          ? '<strong>captureOnce</strong><p style="color:#636c76;margin:6px 0 0">Latest commit · abc123 · authored by AashayShingre</p>'
+          : '<strong>AashayShingre</strong><p style="color:#636c76;margin:6px 0 0">Aashay Shingre · Flipkart</p>';
+        const r = el.getBoundingClientRect();
+        pop.style.left = r.left + 'px';
+        pop.style.top = (r.bottom + 8) + 'px';
+        pop.style.display = 'block';
+      }, HOVER_DELAY);
+    }
+    function closeCard() { clearTimeout(timer); pop.style.display = 'none'; }
+
+    document.addEventListener('mouseover', (e) => {
+      const el = e.target.closest && e.target.closest('[data-hovercard-url]');
+      if (el) tryOpen(el, false); // guarded by native :hover — synthetic events fail here
+    });
+    document.addEventListener('mouseout', (e) => {
+      const el = e.target.closest && e.target.closest('[data-hovercard-url]');
+      if (el) closeCard();
+    });
+    // GitHub's accessible trigger: Alt+ArrowUp opens the hovercard for the
+    // CURRENTLY FOCUSED hovercard link. Keyed off document.activeElement (like
+    // GitHub), so it works even when focusin didn't fire (unfocused window).
+    document.addEventListener('keydown', (e) => {
+      if (e.altKey && e.key === 'ArrowUp') {
+        const a = document.activeElement;
+        const el = a && a.closest && a.closest('[data-hovercard-url]');
+        if (el) tryOpen(el, true);
+      }
+    });
+  </script>
+
+  <script>
+    // ── chrome shim (CAPTURE_VISIBLE → html2canvas of viewport) ──
+    const listeners = [];
+    window.chrome = {
+      runtime: {
+        lastError: null,
+        sendMessage(msg, cb) {
+          if (msg && msg.type === 'CAPTURE_VISIBLE') {
+            html2canvas(document.documentElement, {
+              x: scrollX, y: scrollY, width: innerWidth, height: innerHeight,
+              scale: devicePixelRatio || 1, logging: false, backgroundColor: '#ffffff',
+            }).then(c => cb && cb({ dataUrl: c.toDataURL('image/png') }))
+              .catch(() => cb && cb({ dataUrl: null }));
+            return;
+          }
+          if (cb) cb({ ok: true }); return Promise.resolve({ ok: true });
+        },
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+      },
+      scripting: {},
+    };
+    window.__dispatch = (message) => new Promise((resolve) => {
+      let answered = false;
+      const sendResponse = (r) => { answered = true; resolve(r); };
+      for (const fn of listeners) { if (fn(message, {}, sendResponse) === true) return; }
+      if (!answered) resolve(undefined);
+    });
+  </script>
+  <script src="../content.js"></script>
+  <script>
+    window.runProbeTest = async () => {
+      const t = document.getElementById('target'); const r = t.getBoundingClientRect();
+      const resp = await window.__dispatch({ type:'REPROBE', captureId:'gh', selector:'#target',
+        rect:{top:r.top,left:r.left,width:r.width,height:r.height} });
+      return { ok: resp && resp.ok, count: resp && resp.states ? resp.states.length : 0,
+        states: (resp && resp.states || []).map(s => ({ trigger:s.trigger, added:(s.addedNodes||[]).length,
+          attr:(s.attrChanges||[]).length, shot:!!s.screenshot })) };
+    };
+  </script>
+</body>
+</html>
