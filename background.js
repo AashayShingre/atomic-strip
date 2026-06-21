@@ -17,12 +17,10 @@ let captureChain = Promise.resolve();
 let lastCaptureTs = 0;
 const MIN_CAPTURE_GAP_MS = 700;
 
-function queuedCapture(windowId) {
-  captureChain = captureChain.then(async () => {
-    const wait = Math.max(0, MIN_CAPTURE_GAP_MS - (Date.now() - lastCaptureTs));
-    if (wait) await new Promise((r) => setTimeout(r, wait));
-    return new Promise((resolve) => {
-      chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, (dataUrl) => {
+function captureOnce(windowId) {
+  return new Promise((resolve) => {
+    try {
+      const cb = (dataUrl) => {
         lastCaptureTs = Date.now();
         if (chrome.runtime.lastError) {
           console.warn('[atomic-strip] captureVisibleTab failed:', chrome.runtime.lastError.message);
@@ -30,10 +28,33 @@ function queuedCapture(windowId) {
         } else {
           resolve(dataUrl || null);
         }
-      });
-    });
+      };
+      // windowId may be undefined (e.g. message lost its sender tab) — fall back
+      // to the current window rather than throwing on an invalid id.
+      if (windowId == null) chrome.tabs.captureVisibleTab({ format: 'png' }, cb);
+      else chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, cb);
+    } catch (e) {
+      lastCaptureTs = Date.now();
+      console.warn('[atomic-strip] captureVisibleTab threw:', e && e.message);
+      resolve(null);
+    }
   });
-  return captureChain;
+}
+
+function queuedCapture(windowId) {
+  // Run after whatever is already queued, but NEVER inherit a rejection — a
+  // single failed capture must not poison every subsequent one for the session.
+  const next = captureChain.then(async () => {
+    const wait = Math.max(0, MIN_CAPTURE_GAP_MS - (Date.now() - lastCaptureTs));
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    return captureOnce(windowId);
+  }).catch((e) => {
+    console.warn('[atomic-strip] capture chain error:', e && e.message);
+    return null;
+  });
+  // The chain we hand to the NEXT caller is always resolved (poison-proof).
+  captureChain = next.catch(() => null);
+  return next;
 }
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {

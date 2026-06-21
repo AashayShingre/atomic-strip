@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Latest Commit</title>
+<style>
+  :root {
+    --gh-canvas: #ffffff;
+    --gh-subtle: #f6f8fa;
+    --gh-border: #d0d7de;
+    --gh-fg: #1f2328;
+    --gh-muted: #636c76;
+    --gh-accent: #0969da;
+    --gh-shadow: 0 1px 3px rgba(31,35,40,0.04), 0 8px 24px rgba(66,74,83,0.12);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 64px; background: var(--gh-canvas);
+    font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--gh-fg); -webkit-font-smoothing: antialiased;
+    display: flex; justify-content: center; align-items: flex-start; min-height: 100vh;
+  }
+  .latest-commit {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    background: var(--gh-subtle); border: 1px solid var(--gh-border); border-radius: 6px;
+    font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--gh-fg); width: 520px; max-width: 100%;
+  }
+  .author-wrap { position: relative; display: inline-flex; }
+  .author-link { font-weight: 600; color: var(--gh-fg); text-decoration: none; border-radius: 3px; outline-offset: 2px; }
+  .author-link:hover, .author-link:focus-visible { color: var(--gh-accent); text-decoration: underline; }
+  .author-link:focus-visible { outline: 2px solid var(--gh-accent); }
+  .commit-msg { color: var(--gh-muted); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 3px; }
+  .commit-msg:hover, .commit-msg:focus-visible { color: var(--gh-accent); text-decoration: underline; }
+  .commit-sha { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; color: var(--gh-muted); font-size: 13px; }
+  .commit-date { color: var(--gh-muted); margin-left: auto; white-space: nowrap; }
+  .Popover {
+    position: absolute; z-index: 100; top: calc(100% + 8px); left: 0; display: block;
+    opacity: 0; visibility: hidden; transform: translateY(-4px) scale(0.98); transform-origin: top left;
+    transition: opacity 140ms ease, transform 140ms ease, visibility 0s linear 140ms; pointer-events: none;
+  }
+  .Popover.is-open {
+    opacity: 1; visibility: visible; transform: translateY(0) scale(1);
+    transition: opacity 140ms ease, transform 140ms ease, visibility 0s; pointer-events: auto;
+  }
+  .Popover-message { position: relative; background: var(--gh-canvas); border: 1px solid var(--gh-border); border-radius: 12px; box-shadow: var(--gh-shadow); padding: 16px; }
+  .Popover-message--large { width: 360px; }
+  .hovercard-body { display: flex; gap: 12px; align-items: flex-start; }
+  .avatar { width: 48px; height: 48px; border-radius: 50%; flex-shrink: 0; background: #eaeef2; border: 1px solid rgba(31,35,40,0.10); object-fit: cover; }
+  .hovercard-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .hovercard-name { color: var(--gh-fg); text-decoration: none; font-size: 14px; line-height: 1.3; }
+  .hovercard-name strong { font-weight: 600; }
+  .hovercard-bio { margin: 2px 0 0; color: var(--gh-muted); font-size: 13px; line-height: 1.4; }
+  .hovercard-org { display: inline-flex; align-items: center; gap: 4px; margin-top: 2px; color: var(--gh-muted); font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="latest-commit">
+    <span class="author-wrap">
+      <a href="/prateek-gupta3" class="author-link" data-hovercard-url="/users/prateek-gupta3/hovercard" aria-describedby="hovercard-prateek">prateek-gupta3</a>
+      <div class="Popover js-hovercard-content" id="hovercard-prateek" role="region" aria-label="Hovercard">
+        <div class="Popover-message Popover-message--large">
+          <div class="hovercard-body">
+            <div class="avatar"></div>
+            <div class="hovercard-info">
+              <a href="/prateek-gupta3" class="hovercard-name"><strong>prateek-gupta3</strong> · Prateek Gupta</a>
+              <p class="hovercard-bio">Software engineer. Working on creator tooling.</p>
+              <span class="hovercard-org">Flipkart</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </span>
+    <a href="/commit/8f22b99" class="commit-msg">Update ContentType.java (#365)</a>
+    <span class="commit-sha">8f22b99</span>
+    <span class="commit-date">3 days ago</span>
+  </div>
+  <script>
+    (function () {
+      const wrap = document.querySelector('.author-wrap');
+      const link = wrap.querySelector('.author-link');
+      const popover = wrap.querySelector('.js-hovercard-content');
+      const OPEN_DELAY = 200, CLOSE_DELAY = 250;
+      let openTimer = null, closeTimer = null;
+      function open() { clearTimeout(closeTimer); clearTimeout(openTimer); openTimer = setTimeout(() => popover.classList.add('is-open'), OPEN_DELAY); }
+      function close() { clearTimeout(openTimer); clearTimeout(closeTimer); closeTimer = setTimeout(() => popover.classList.remove('is-open'), CLOSE_DELAY); }
+      function closeNow() { clearTimeout(openTimer); clearTimeout(closeTimer); popover.classList.remove('is-open'); }
+      link.addEventListener('mouseenter', open);
+      link.addEventListener('mouseleave', close);
+      link.addEventListener('focus', () => { clearTimeout(closeTimer); popover.classList.add('is-open'); });
+      link.addEventListener('blur', close);
+      popover.addEventListener('mouseenter', () => clearTimeout(closeTimer));
+      popover.addEventListener('mouseleave', close);
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeNow(); });
+    })();
+  </script>
+</body>
+</html>
