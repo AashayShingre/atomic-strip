@@ -694,7 +694,7 @@
   }
 
   function findCandidates(root) {
-    const sel = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[title],[tabindex],[data-interaction]';
+    const sel = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[data-hovercard-url],[data-hovercard-type],[title],[tabindex],[data-interaction]';
     let list = [root, ...root.querySelectorAll(sel)];
     root.querySelectorAll('*').forEach((e) => { if (getComputedStyle(e).cursor === 'pointer') list.push(e); });
     list = [...new Set(list)];
@@ -702,7 +702,7 @@
       let s = 0;
       if (e === root) s += 5;
       if (e.hasAttribute && e.hasAttribute('data-interaction')) s += 4;
-      try { if (e.matches('[aria-haspopup],[aria-expanded],[data-tooltip]')) s += 3; } catch {}
+      try { if (e.matches('[aria-haspopup],[aria-expanded],[data-tooltip],[data-hovercard-url],[data-hovercard-type]')) s += 3; } catch {}
       try { if (e.matches('button,a,[role="button"]')) s += 1; } catch {}
       return -s;
     };
@@ -760,7 +760,7 @@
   }
   function hideCursor() { probeCursor?.remove(); probeCursor = null; }
 
-  const INTERACTIVE_SEL = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[title],[tabindex],[data-interaction]';
+  const INTERACTIVE_SEL = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[data-hovercard-url],[data-hovercard-type],[title],[tabindex],[data-interaction]';
   const NESTED_PARENTS = 2;     // revealed parents expanded one level deeper
   const NESTED_CHILDREN = 3;    // revealed children probed per expanded parent
   const MAX_STATES = 12;        // hard cap on states captured per component
@@ -827,6 +827,11 @@
     // (the latter catches popovers outside the picked element / shadow DOM).
     const domChanged = summary.addedNodes.length || summary.attrChanges.length;
     const changedRect = await diffRect(baselineFull, afterFull);
+    console.debug('[atomic-strip] probe', describeEl(el), action, {
+      mutations: mutations.length, addedNodes: summary.addedNodes.length,
+      attrChanges: summary.attrChanges.length, changedRect: !!changedRect,
+      baselineFull: !!baselineFull, afterFull: !!afterFull,
+    });
     if (!domChanged && !changedRect) { undo(); await sleep(PROBE_RESET_MS); return null; }
 
     // Crop to the union of the DOM box and the changed-pixels box, so an
@@ -834,6 +839,7 @@
     const domRect = probeUnionRect(root, [...summary.addedEls, el]);
     const rect = changedRect ? unionRects(domRect, changedRect) : domRect;
     const screenshot = await cropInPage(afterFull, rect, dpr);
+    if (!screenshot) console.warn('[atomic-strip] reveal detected but screenshot crop failed for', describeEl(el), action);
 
     undo();
     await sleep(PROBE_RESET_MS);
@@ -919,6 +925,7 @@
       const candidates = findCandidates(root);
       const baselineVisible = currentInteractive();
       const baselineFull = await captureHidingCursor();
+      console.debug('[atomic-strip] sweep start', { root: describeEl(root), candidates: candidates.length, baselineFull: !!baselineFull });
 
       // Top-level pass: probe every interactive part.
       const expandable = [];
@@ -926,7 +933,10 @@
         if (states.length >= MAX_STATES) break;
         try {
           const state = await probeAction(root, el, 'hover', baselineFull);
-          if (state && state.screenshot) {
+          // Keep any state where a reveal was detected (probeAction already
+          // returned null for true no-ops). A missing screenshot is a capture
+          // hiccup — don't throw away the interaction spec along with it.
+          if (state) {
             states.push(state);
             if (state.addedNodes && state.addedNodes.length) expandable.push(el);
           }
@@ -950,7 +960,7 @@
             if (states.length >= MAX_STATES) break;
             try {
               const state = await probeChildOpen(root, parentEl, child, 'hover', baselineFull2);
-              if (state && state.screenshot) states.push(state);
+              if (state) states.push(state);
             } catch (err) {
               console.warn('[atomic-strip] nested action failed:', err);
             }
@@ -970,6 +980,7 @@
       label: s.label, trigger: s.trigger, action: s.action,
       addedNodes: s.addedNodes, attrChanges: s.attrChanges, screenshot: s.screenshot,
     }));
+    console.debug('[atomic-strip] sweep done', { captured: clean.length, withScreenshot: clean.filter((s) => s.screenshot).length });
     return clean;
   }
 
