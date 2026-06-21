@@ -569,35 +569,52 @@
   }
 
   // Ask the background worker for a throttled screenshot of the visible tab.
-  function requestScreenshot() {
+  function requestScreenshotOnce() {
     return new Promise((resolve) => {
       try {
         chrome.runtime.sendMessage({ type: 'CAPTURE_VISIBLE' }, (resp) => {
-          if (chrome.runtime.lastError) { resolve(null); return; }
+          if (chrome.runtime.lastError) { console.warn('[atomic-strip] capture error:', chrome.runtime.lastError.message); resolve(null); return; }
           resolve(resp?.dataUrl || null);
         });
-      } catch { resolve(null); }
+      } catch (e) { console.warn('[atomic-strip] capture threw:', e?.message); resolve(null); }
     });
+  }
+
+  // captureVisibleTab is rate-limited and can return null when called too soon
+  // after the previous capture. Retry once after a short wait before giving up.
+  async function requestScreenshot() {
+    let url = await requestScreenshotOnce();
+    if (!url) { await sleep(800); url = await requestScreenshotOnce(); }
+    return url;
   }
 
   // Crop a full-tab screenshot to a viewport-space rect, in page context.
   function cropInPage(dataUrl, rect, dpr) {
     return new Promise((resolve) => {
-      if (!dataUrl) { resolve(null); return; }
+      if (!dataUrl) { console.warn('[atomic-strip] crop: no screenshot (capture returned null)'); resolve(null); return; }
       const img = new Image();
       img.onload = () => {
+        // Clamp the source rect to the actual image bounds — an element scrolled
+        // partly off-screen, or rounding, can push coords past the edge and make
+        // drawImage produce a blank/failed canvas.
+        let sx = Math.max(0, Math.round(rect.left * dpr));
+        let sy = Math.max(0, Math.round(rect.top * dpr));
+        let sw = Math.round(rect.width * dpr);
+        let sh = Math.round(rect.height * dpr);
+        sw = Math.max(1, Math.min(sw, img.naturalWidth - sx));
+        sh = Math.max(1, Math.min(sh, img.naturalHeight - sy));
+        if (!img.naturalWidth || !img.naturalHeight || sx >= img.naturalWidth || sy >= img.naturalHeight) {
+          console.warn('[atomic-strip] crop: rect outside image', { sx, sy, iw: img.naturalWidth, ih: img.naturalHeight });
+          resolve(null); return;
+        }
         const c = document.createElement('canvas');
-        c.width = Math.max(1, Math.round(rect.width * dpr));
-        c.height = Math.max(1, Math.round(rect.height * dpr));
+        c.width = sw; c.height = sh;
         try {
-          c.getContext('2d').drawImage(
-            img, rect.left * dpr, rect.top * dpr, rect.width * dpr, rect.height * dpr,
-            0, 0, c.width, c.height
-          );
+          c.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
           resolve(c.toDataURL('image/png'));
-        } catch { resolve(null); }
+        } catch (e) { console.warn('[atomic-strip] crop: drawImage/toDataURL failed', e?.message); resolve(null); }
       };
-      img.onerror = () => resolve(null);
+      img.onerror = () => { console.warn('[atomic-strip] crop: screenshot failed to decode'); resolve(null); };
       img.src = dataUrl;
     });
   }
