@@ -621,6 +621,19 @@
     return { top, left, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
   }
 
+  // Fraction of `changed`'s area that lies OUTSIDE `ref` (0 = fully inside ref,
+  // 1 = fully outside). Used to tell a real reveal (tooltip/popover that appears
+  // somewhere new) from an in-place hover recolor confined to the element itself.
+  function fractionOutside(changed, ref) {
+    if (!changed) return 0;
+    if (!ref) return 1;
+    const ix = Math.max(0, Math.min(changed.left + changed.width, ref.left + ref.width) - Math.max(changed.left, ref.left));
+    const iy = Math.max(0, Math.min(changed.top + changed.height, ref.top + ref.height) - Math.max(changed.top, ref.top));
+    const interArea = ix * iy;
+    const changedArea = Math.max(1, changed.width * changed.height);
+    return 1 - interArea / changedArea;
+  }
+
   // Compare two full-tab screenshots and return the viewport-space bounding box
   // of the region that changed (or null if negligible). This catches reveals
   // that appear ANYWHERE on screen — portaled hovercards, popovers rendered
@@ -823,21 +836,27 @@
     const dpr = window.devicePixelRatio || 1;
     const afterFull = await captureHidingCursor();
 
-    // A reveal counts if the DOM changed OR pixels changed anywhere on screen
-    // (the latter catches popovers outside the picked element / shadow DOM).
+    // A reveal counts if the DOM changed (real popover/tooltip/menu injected) OR
+    // pixels changed in a region that lands OUTSIDE the hovered element — a new
+    // tooltip/hovercard/dropdown appearing elsewhere. A pixel change confined to
+    // the element's own box is just an in-place hover recolor (reproducible via
+    // CSS :hover), so we ignore it to avoid flooding the output with noise.
     const domChanged = summary.addedNodes.length || summary.attrChanges.length;
     const changedRect = await diffRect(baselineFull, afterFull);
+    const elRect = el.getBoundingClientRect();
+    const refRect = { top: elRect.top - 8, left: elRect.left - 8, width: elRect.width + 16, height: elRect.height + 16 };
+    const pixelReveal = !!changedRect && fractionOutside(changedRect, refRect) > 0.35;
     console.debug('[atomic-strip] probe', describeEl(el), action, {
       mutations: mutations.length, addedNodes: summary.addedNodes.length,
       attrChanges: summary.attrChanges.length, changedRect: !!changedRect,
-      baselineFull: !!baselineFull, afterFull: !!afterFull,
+      pixelReveal, baselineFull: !!baselineFull, afterFull: !!afterFull,
     });
-    if (!domChanged && !changedRect) { undo(); await sleep(PROBE_RESET_MS); return null; }
+    if (!domChanged && !pixelReveal) { undo(); await sleep(PROBE_RESET_MS); return null; }
 
     // Crop to the union of the DOM box and the changed-pixels box, so an
     // off-element popover is always inside the screenshot.
     const domRect = probeUnionRect(root, [...summary.addedEls, el]);
-    const rect = changedRect ? unionRects(domRect, changedRect) : domRect;
+    const rect = pixelReveal ? unionRects(domRect, changedRect) : domRect;
     const screenshot = await cropInPage(afterFull, rect, dpr);
     if (!screenshot) console.warn('[atomic-strip] reveal detected but screenshot crop failed for', describeEl(el), action);
 
@@ -876,10 +895,13 @@
 
     const domChanged = summary.addedNodes.length || summary.attrChanges.length;
     const changedRect = await diffRect(baselineFull, afterFull);
-    if (!domChanged && !changedRect) { undo(); await sleep(PROBE_RESET_MS); return null; }
+    const cr = childEl.getBoundingClientRect();
+    const refRect = { top: cr.top - 8, left: cr.left - 8, width: cr.width + 16, height: cr.height + 16 };
+    const pixelReveal = !!changedRect && fractionOutside(changedRect, refRect) > 0.35;
+    if (!domChanged && !pixelReveal) { undo(); await sleep(PROBE_RESET_MS); return null; }
 
     const domRect = probeUnionRect(root, [...summary.addedEls, parentEl, childEl]);
-    const rect = changedRect ? unionRects(domRect, changedRect) : domRect;
+    const rect = pixelReveal ? unionRects(domRect, changedRect) : domRect;
     const screenshot = await cropInPage(afterFull, rect, dpr);
 
     undo();
