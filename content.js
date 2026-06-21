@@ -450,8 +450,10 @@
   const PROBE_MAX = 16;       // cap how many interactive parts we exercise
   const PROBE_SETTLE_MS = 500; // minimum wait for transitions / JS after hover
   const PROBE_RESET_MS = 220;  // wait after un-hover before the next probe
-  const PROBE_QUIET_MS = 500;  // consider settled after this long with no DOM changes
-  const PROBE_MAX_WAIT_MS = 4000; // hard cap waiting for slow async reveals
+  const PROBE_QUIET_MS = 850;  // consider settled after this long with no DOM changes
+                               // (wide enough to bridge a typical fetch gap in an
+                               //  async tooltip/hovercard before its content lands)
+  const PROBE_MAX_WAIT_MS = 6000; // hard cap waiting for slow async reveals
   const FORCE_STATE_CLASS = '__as_force_state__';
   const STATE_PSEUDO = /:(hover|focus|focus-visible|focus-within|active)\b/g;
 
@@ -605,7 +607,12 @@
   function probeUnionRect(root, addedEls) {
     const rects = [root.getBoundingClientRect()];
     root.querySelectorAll('*').forEach((e) => { if (isVisible(e)) rects.push(e.getBoundingClientRect()); });
-    addedEls.forEach((e) => { if (isVisible(e)) rects.push(e.getBoundingClientRect()); });
+    // Include each added element AND its visible descendants, so portaled
+    // dropdowns/tooltips whose wrapper has no size aren't clipped out.
+    addedEls.forEach((e) => {
+      if (isVisible(e)) rects.push(e.getBoundingClientRect());
+      try { e.querySelectorAll('*').forEach((c) => { if (isVisible(c)) rects.push(c.getBoundingClientRect()); }); } catch {}
+    });
     let top = Infinity, left = Infinity, right = -Infinity, bottom = -Infinity;
     rects.forEach((r) => {
       top = Math.min(top, r.top); left = Math.min(left, r.left);
@@ -636,13 +643,21 @@
     return list.slice(0, PROBE_MAX);
   }
 
+  // True if the node itself, or any descendant, is visible. Catches portaled
+  // reveals where the added wrapper has zero size but its content is shown.
+  function anyVisible(n) {
+    if (!n || n.nodeType !== 1) return false;
+    if (isVisible(n)) return true;
+    try { return [...n.querySelectorAll('*')].some(isVisible); } catch { return false; }
+  }
+
   function summarizeMutations(mutations) {
     const addedNodes = [], addedEls = [], attrChanges = [];
     const seenAttr = new Set();
     for (const m of mutations) {
       if (m.type === 'childList') {
         m.addedNodes.forEach((n) => {
-          if (n.nodeType === 1 && isVisible(n)) {
+          if (n.nodeType === 1 && anyVisible(n)) {
             addedEls.push(n);
             addedNodes.push({ selector: describeEl(n), html: (n.outerHTML || '').slice(0, 1500) });
           }
@@ -726,7 +741,7 @@
   async function probeAction(root, el, action, baselineFull) {
     const mutations = [];
     const obs = new MutationObserver((m) => mutations.push(...m));
-    obs.observe(document.body, {
+    obs.observe(document.documentElement, {
       subtree: true, childList: true, attributes: true,
       attributeFilter: ['class', 'style', 'hidden', 'open', 'aria-expanded', 'aria-hidden', 'data-state'],
     });
@@ -768,7 +783,7 @@
   async function probeChildOpen(root, parentEl, childEl, action, baselineFull) {
     const mutations = [];
     const obs = new MutationObserver((m) => mutations.push(...m));
-    obs.observe(document.body, {
+    obs.observe(document.documentElement, {
       subtree: true, childList: true, attributes: true,
       attributeFilter: ['class', 'style', 'hidden', 'open', 'aria-expanded', 'aria-hidden', 'data-state'],
     });
@@ -808,7 +823,7 @@
   async function openState(parentEl) {
     const mutations = [];
     const obs = new MutationObserver((m) => mutations.push(...m));
-    obs.observe(document.body, { subtree: true, childList: true, attributes: true });
+    obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
     const undoForce = applyForcedHover(parentEl);
     dispatchHover(parentEl);
     await waitForSettle(() => mutations.length);
