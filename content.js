@@ -601,6 +601,73 @@
     });
   }
 
+  function loadImg(src) {
+    return new Promise((res) => {
+      if (!src) { res(null); return; }
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => res(null);
+      i.src = src;
+    });
+  }
+
+  function unionRects(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    const left = Math.min(a.left, b.left);
+    const top = Math.min(a.top, b.top);
+    const right = Math.max(a.left + a.width, b.left + b.width);
+    const bottom = Math.max(a.top + a.height, b.top + b.height);
+    return { top, left, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+  }
+
+  // Compare two full-tab screenshots and return the viewport-space bounding box
+  // of the region that changed (or null if negligible). This catches reveals
+  // that appear ANYWHERE on screen — portaled hovercards, popovers rendered
+  // outside the picked element, even shadow-DOM content the observer can't see.
+  async function diffRect(beforeUrl, afterUrl) {
+    const [a, b] = await Promise.all([loadImg(beforeUrl), loadImg(afterUrl)]);
+    if (!a || !b) return null;
+    const W = Math.min(a.naturalWidth, b.naturalWidth);
+    const H = Math.min(a.naturalHeight, b.naturalHeight);
+    if (!W || !H) return null;
+
+    const sw = Math.min(360, W);
+    const sh = Math.max(1, Math.round(H * (sw / W)));
+    const ca = document.createElement('canvas'); ca.width = sw; ca.height = sh;
+    const cb = document.createElement('canvas'); cb.width = sw; cb.height = sh;
+    const xa = ca.getContext('2d', { willReadFrequently: true });
+    const xb = cb.getContext('2d', { willReadFrequently: true });
+    xa.drawImage(a, 0, 0, sw, sh);
+    xb.drawImage(b, 0, 0, sw, sh);
+    let da, db;
+    try { da = xa.getImageData(0, 0, sw, sh).data; db = xb.getImageData(0, 0, sw, sh).data; }
+    catch { return null; }
+
+    let minX = sw, minY = sh, maxX = -1, maxY = -1, count = 0;
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        const i = (y * sw + x) * 4;
+        const diff = Math.abs(da[i] - db[i]) + Math.abs(da[i + 1] - db[i + 1]) + Math.abs(da[i + 2] - db[i + 2]);
+        if (diff > 40) {
+          count++;
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (count < sw * sh * 0.0008) return null; // negligible (noise / antialiasing)
+
+    const scaleX = window.innerWidth / sw;
+    const scaleY = window.innerHeight / sh;
+    const PAD = 10;
+    const left = Math.max(0, minX * scaleX - PAD);
+    const top = Math.max(0, minY * scaleY - PAD);
+    const right = Math.min(window.innerWidth, (maxX + 1) * scaleX + PAD);
+    const bottom = Math.min(window.innerHeight, (maxY + 1) * scaleY + PAD);
+    return { top, left, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+  }
+
   // Bounding box of root + every currently-visible descendant + any added nodes
   // (so absolutely-positioned dropdowns / portaled tooltips aren't clipped),
   // clamped to the viewport and padded.
@@ -753,20 +820,23 @@
     obs.disconnect();
 
     const summary = summarizeMutations(mutations);
-    const rect = probeUnionRect(root, [...summary.addedEls, el]);
     const dpr = window.devicePixelRatio || 1;
     const afterFull = await captureHidingCursor();
+
+    // A reveal counts if the DOM changed OR pixels changed anywhere on screen
+    // (the latter catches popovers outside the picked element / shadow DOM).
+    const domChanged = summary.addedNodes.length || summary.attrChanges.length;
+    const changedRect = await diffRect(baselineFull, afterFull);
+    if (!domChanged && !changedRect) { undo(); await sleep(PROBE_RESET_MS); return null; }
+
+    // Crop to the union of the DOM box and the changed-pixels box, so an
+    // off-element popover is always inside the screenshot.
+    const domRect = probeUnionRect(root, [...summary.addedEls, el]);
+    const rect = changedRect ? unionRects(domRect, changedRect) : domRect;
     const screenshot = await cropInPage(afterFull, rect, dpr);
 
     undo();
     await sleep(PROBE_RESET_MS);
-
-    // No DOM change AND the same pixels as the resting state → nothing happened.
-    const changed = summary.addedNodes.length || summary.attrChanges.length;
-    if (!changed && baselineFull) {
-      const baseCrop = await cropInPage(baselineFull, rect, dpr);
-      if (baseCrop && baseCrop === screenshot) return null;
-    }
 
     return {
       label: `${action} ${describeEl(el)}`,
@@ -795,19 +865,19 @@
     obs.disconnect();
 
     const summary = summarizeMutations(mutations);
-    const rect = probeUnionRect(root, [...summary.addedEls, parentEl, childEl]);
     const dpr = window.devicePixelRatio || 1;
     const afterFull = await captureHidingCursor();
+
+    const domChanged = summary.addedNodes.length || summary.attrChanges.length;
+    const changedRect = await diffRect(baselineFull, afterFull);
+    if (!domChanged && !changedRect) { undo(); await sleep(PROBE_RESET_MS); return null; }
+
+    const domRect = probeUnionRect(root, [...summary.addedEls, parentEl, childEl]);
+    const rect = changedRect ? unionRects(domRect, changedRect) : domRect;
     const screenshot = await cropInPage(afterFull, rect, dpr);
 
     undo();
     await sleep(PROBE_RESET_MS);
-
-    const changed = summary.addedNodes.length || summary.attrChanges.length;
-    if (!changed && baselineFull) {
-      const baseCrop = await cropInPage(baselineFull, rect, dpr);
-      if (baseCrop && baseCrop === screenshot) return null;
-    }
 
     return {
       label: `${describeEl(parentEl)} → ${action} ${describeEl(childEl)}`,
