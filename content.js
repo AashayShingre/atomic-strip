@@ -448,12 +448,31 @@
   // ─────────────────────────────────────────────
 
   const PROBE_MAX = 16;       // cap how many interactive parts we exercise
-  const PROBE_SETTLE_MS = 340; // wait for transitions / JS after hover
-  const PROBE_RESET_MS = 180;  // wait after un-hover before the next probe
+  const PROBE_SETTLE_MS = 500; // minimum wait for transitions / JS after hover
+  const PROBE_RESET_MS = 220;  // wait after un-hover before the next probe
+  const PROBE_QUIET_MS = 500;  // consider settled after this long with no DOM changes
+  const PROBE_MAX_WAIT_MS = 4000; // hard cap waiting for slow async reveals
   const FORCE_STATE_CLASS = '__as_force_state__';
   const STATE_PSEUDO = /:(hover|focus|focus-visible|focus-within|active)\b/g;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Wait for content to settle after an action: always wait at least PROBE_SETTLE_MS,
+  // then keep waiting until `getCount()` (e.g. mutation count) stops changing for
+  // PROBE_QUIET_MS — so slow, async-loaded reveals (tooltips, fetched menus) are
+  // captured — up to PROBE_MAX_WAIT_MS.
+  async function waitForSettle(getCount) {
+    const start = Date.now();
+    await sleep(PROBE_SETTLE_MS);
+    let last = getCount ? getCount() : 0;
+    let lastChange = Date.now();
+    while (Date.now() - start < PROBE_MAX_WAIT_MS) {
+      await sleep(150);
+      const c = getCount ? getCount() : 0;
+      if (c !== last) { last = c; lastChange = Date.now(); }
+      else if (Date.now() - lastChange >= PROBE_QUIET_MS) break;
+    }
+  }
 
   function stripPseudo(selectorText) {
     return selectorText
@@ -715,7 +734,7 @@
     moveCursorTo(el);
     await sleep(120); // let the cursor glide
     const undo = performAction(el, action);
-    await sleep(PROBE_SETTLE_MS);
+    await waitForSettle(() => mutations.length); // wait out slow async reveals
     obs.disconnect();
 
     const summary = summarizeMutations(mutations);
@@ -757,7 +776,7 @@
     moveCursorTo(childEl);
     await sleep(120);
     const undo = performAction(childEl, action);
-    await sleep(PROBE_SETTLE_MS);
+    await waitForSettle(() => mutations.length); // wait out slow async reveals
     obs.disconnect();
 
     const summary = summarizeMutations(mutations);
@@ -787,9 +806,13 @@
 
   // Open a parent (hover, no reset) and return a cleanup fn.
   async function openState(parentEl) {
+    const mutations = [];
+    const obs = new MutationObserver((m) => mutations.push(...m));
+    obs.observe(document.body, { subtree: true, childList: true, attributes: true });
     const undoForce = applyForcedHover(parentEl);
     dispatchHover(parentEl);
-    await sleep(PROBE_SETTLE_MS);
+    await waitForSettle(() => mutations.length);
+    obs.disconnect();
     return () => { dispatchUnhover(parentEl); undoForce(); };
   }
 

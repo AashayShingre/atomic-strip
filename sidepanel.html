@@ -135,12 +135,14 @@
         <button class="btn-secondary" id="btn-preview-copy">Copy HTML &amp; CSS</button>
         <button class="btn-secondary" id="btn-preview-preview">Preview HTML &amp; CSS</button>
         <button class="btn-secondary" id="btn-save-component">Save HTML &amp; CSS</button>
-        <select class="effort-select" id="recon-effort" title="How hard the agent tries: more passes = closer match, more API calls">
-          <option value="low">Effort: Low · 1 try</option>
-          <option value="medium" selected>Effort: Medium · 3 tries</option>
-          <option value="high">Effort: High · 5 tries</option>
-        </select>
-        <button class="btn-primary" id="btn-preview-reconstruct">✦ Reconstruct with AI</button>
+        <div class="reconstruct-group">
+          <select class="effort-select" id="recon-effort" title="How hard the agent tries: more passes = closer match, more API calls">
+            <option value="low">Low · 1 try</option>
+            <option value="medium" selected>Medium · 3 tries</option>
+            <option value="high">High · 5 tries</option>
+          </select>
+          <button class="btn-primary" id="btn-preview-reconstruct">✦ Reconstruct with AI</button>
+        </div>
       </div>
       <div class="preview-error" id="preview-error" style="display:none"></div>
       <!-- Live progress of the agentic self-verification loop -->

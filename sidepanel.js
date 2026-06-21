@@ -500,7 +500,9 @@ Original component HTML:
 ${(component.html || '').slice(0, 4000)}
 \`\`\`
 
-Looking at IMAGE 1 and the HTML, identify interactive affordances (menu/dropdown triggers, items with chevrons, avatars, "more"/kebab buttons, tabs, tooltips via title/aria, etc.) whose revealed behavior is NOT in the captured list above and would help reconstruct the component faithfully. For each, give a CSS selector valid against the original HTML and the action to try. Omit anything already captured. Return at most 4.
+Looking at IMAGE 1 and the HTML, identify interactive affordances (menu/dropdown triggers, items with chevrons, avatars, "more"/kebab buttons, tabs, etc.) whose revealed behavior is genuinely missing and would help reconstruct the component faithfully. For each, give a CSS selector valid against the original HTML and the action to try. Return at most 4.
+
+Do NOT flag an interaction if its markup or styling is ALREADY PRESENT in the original HTML above — e.g. a \`title\`/\`aria-label\`/\`data-tooltip\` tooltip, a menu element already in the DOM, or an element with CSS \`:hover\` rules. Those are already reproducible from the HTML/CSS, so re-probing them is wasteful and risks degrading a correct result. Only flag interactions that appear to be created dynamically (not in the HTML) AND are not already in the captured list. If everything is already covered, return an empty list.
 
 Respond with ONLY a JSON object (no markdown, no commentary):
 {
@@ -562,7 +564,9 @@ ${currentHtml}
 \`\`\`
 ${interactionSpec}
 
-Return the FULL corrected, self-contained HTML file. Preserve all working interactive behaviors and observed interaction states. Output ONLY raw HTML — no markdown fences, no commentary.`
+CRITICAL: This is a targeted fix, not a rewrite. Preserve everything that already matches IMAGE 1 — especially tooltips, dropdowns, menus, and interaction states already implemented (often straight from the original HTML/CSS). Change ONLY what's needed to fix the listed issues; do not simplify, restructure, or drop working parts. If an issue isn't clearly an improvement, leave that part as-is.
+
+Return the FULL corrected, self-contained HTML file. Output ONLY raw HTML — no markdown fences, no commentary.`
   }];
 
   const refB64 = referenceShot?.split(',')[1];
@@ -611,7 +615,10 @@ async function agenticReconstruct(component, screenshot, apiKey, provider, inter
     return { html, render: null, interactions: states };
   }
 
-  let lastRender = null;
+  // Keep the best-scoring candidate so a later revision can NEVER make the
+  // final output worse than an earlier (e.g. the initial) generation.
+  let best = { html, render: null, score: -1 };
+
   for (let i = 1; i <= maxIters; i++) {
     onProgress({ phase: 'render', iteration: i });
     const render = await renderHtmlToImage(html);
@@ -619,11 +626,13 @@ async function agenticReconstruct(component, screenshot, apiKey, provider, inter
       onProgress({ phase: 'render-skip', iteration: i });
       break;
     }
-    lastRender = render;
 
     onProgress({ phase: 'critique', iteration: i });
     const review = await critiqueReconstruction(screenshot, render, component, apiKey, provider, states);
     onProgress({ phase: 'verdict', iteration: i, review, render, reference: screenshot });
+
+    const score = typeof review.score === 'number' ? review.score : 0;
+    if (score > best.score) best = { html, render, score };
 
     const restingOk = review.verdict === 'pass' || !review.issues.length;
     if (restingOk && !review.missingInteractions.length) break; // good enough — close the loop
@@ -649,7 +658,9 @@ async function agenticReconstruct(component, screenshot, apiKey, provider, inter
     html = await reviseReconstruction(component, html, review.issues, screenshot, render, apiKey, provider, states);
   }
 
-  return { html, render: lastRender, interactions: states };
+  // Return the best candidate seen (falls back to the initial generation).
+  onProgress({ phase: 'final', score: best.score });
+  return { html: best.score >= 0 ? best.html : html, render: best.render, interactions: states };
 }
 
 async function generateTags(stylesData, apiKey, provider) {
@@ -1177,6 +1188,9 @@ async function reconstructCurrentComponent() {
         break;
       case 'revise':
         verify.setHead(`Applying fixes (pass ${p.iteration})…`);
+        break;
+      case 'final':
+        if (p.score >= 0) verify.addStep('pass', '★', `Kept the best of all passes (score ${p.score}/100).`);
         break;
     }
   };

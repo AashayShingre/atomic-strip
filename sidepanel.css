@@ -591,17 +591,37 @@ html, body {
   flex-wrap: wrap;
 }
 
+/* Effort selector joined to the Reconstruct button as one split control */
+.reconstruct-group {
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.reconstruct-group .effort-select {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+.reconstruct-group .btn-primary {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
 .effort-select {
   font-family: inherit;
   font-size: 11px;
-  padding: 6px 8px;
-  border-radius: 7px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
-  background: var(--bg-elevated, #1a1a26);
-  color: var(--text-secondary, #9a9ab0);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 500;
   cursor: pointer;
 }
-.effort-select:focus { outline: none; border-color: var(--accent); }
+.effort-select:focus { outline: none; }
 
 /* ── Agentic self-verification loop ── */
 .verify-progress {
