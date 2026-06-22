@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>edge case probe test</title>
+<style>
+  html, body { margin: 0; min-height: 100%; background: #fff; font: 14px -apple-system, system-ui, sans-serif; }
+  #target { position: relative; margin: 120px 40px 40px; padding: 12px; border: 1px solid #d0d7de; border-radius: 6px;
+            display: flex; gap: 20px; align-items: center; width: 700px; }
+  button, a { font: inherit; cursor: pointer; }
+
+  /* CASE 1 — hover dropdown (baseline, should work) */
+  .hov { position: relative; }
+  .hov .menu { position: absolute; top: 100%; left: 0; display: none; background:#fff; border:1px solid #ccc; border-radius:8px; padding:8px; box-shadow:0 6px 20px rgba(0,0,0,.15); width:160px; }
+  .hov:hover .menu { display: block; }
+
+  /* CASE 2 — CLICK-only menu (opens on click; hover does nothing) */
+  .clk { position: relative; }
+  .clk .menu { position:absolute; top:100%; left:0; display:none; background:#fff; border:1px solid #ccc; border-radius:8px; padding:8px; box-shadow:0 6px 20px rgba(0,0,0,.15); width:180px; }
+  .clk.open .menu { display:block; }
+
+  /* CASE 3 — tooltip ABOVE the trigger, near the top edge (clamping test) */
+  .tipabove { position: relative; }
+  .tipabove .tt { position:absolute; bottom:100%; left:0; display:none; background:#111; color:#fff; padding:6px 10px; border-radius:6px; white-space:nowrap; }
+  .tipabove:hover .tt { display:block; }
+</style>
+</head>
+<body>
+  <div id="target">
+    <!-- 1: hover -->
+    <span class="hov"><button class="hov-btn" aria-haspopup="true">Hover menu ▾</button>
+      <div class="menu"><div>Profile</div><div>Settings</div><div>Sign out</div></div></span>
+
+    <!-- 2: click-only -->
+    <span class="clk"><button class="clk-btn" aria-haspopup="true" aria-expanded="false">Click menu ▾</button>
+      <div class="menu"><div>New file</div><div>New repo</div><div>Import</div></div></span>
+
+    <!-- 3: tooltip above (near top edge) -->
+    <span class="tipabove"><button class="tip-btn">Help</button><span class="tt">Tooltip above the trigger</span></span>
+
+    <!-- 4: native title tooltip (browser chrome — uncapturable) -->
+    <button class="title-btn" title="native tooltip">Title only</button>
+  </div>
+
+  <script>
+    // CASE 2 wiring: toggle .open on click only (no hover behavior)
+    const clk = document.querySelector('.clk');
+    document.querySelector('.clk-btn').addEventListener('click', (e) => {
+      e.preventDefault();
+      clk.classList.toggle('open');
+      e.currentTarget.setAttribute('aria-expanded', clk.classList.contains('open'));
+    });
+  </script>
+
+  <script src="../vendor/html2canvas.min.js"></script>
+  <script>
+    const listeners = [];
+    window.chrome = { runtime: { lastError:null,
+      sendMessage(m, cb){ if (m && m.type==='CAPTURE_VISIBLE'){ html2canvas(document.documentElement,{x:scrollX,y:scrollY,width:innerWidth,height:innerHeight,scale:devicePixelRatio||1,logging:false,backgroundColor:'#fff'}).then(c=>cb&&cb({dataUrl:c.toDataURL('image/png')})).catch(()=>cb&&cb({dataUrl:null})); return; } if(cb)cb({ok:true}); return Promise.resolve({ok:true}); },
+      onMessage:{ addListener(fn){ listeners.push(fn); } } }, scripting:{} };
+    window.__dispatch = (message) => new Promise((resolve) => { let answered=false; const sendResponse=(r)=>{answered=true;resolve(r);}; for(const fn of listeners){ if(fn(message,{},sendResponse)===true) return; } if(!answered) resolve(undefined); });
+  </script>
+  <script src="../content.js"></script>
+  <script>
+    window.runProbeTest = async () => {
+      const t = document.getElementById('target'); const r = t.getBoundingClientRect();
+      const resp = await window.__dispatch({ type:'REPROBE', captureId:'edge', selector:'#target', rect:{top:r.top,left:r.left,width:r.width,height:r.height} });
+      return JSON.stringify({ count:(resp.states||[]).length,
+        states:(resp.states||[]).map(s=>({ trigger:s.trigger, action:s.action, added:(s.addedNodes||[]).length, attr:(s.attrChanges||[]).length, shot:!!s.screenshot,
+          menuText: (s.addedNodes||[]).map(n=>n.html).join(' ').match(/New file|Profile|Tooltip above/g) })) });
+    };
+  </script>
+</body>
+</html>

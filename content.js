@@ -791,17 +791,38 @@
     return n === probeCursor || (n.nodeType === 1 && n.tagName === 'STYLE' && n.dataset && n.dataset.asForce === '1');
   }
 
-  function summarizeMutations(mutations) {
-    const addedNodes = [], addedEls = [], attrChanges = [];
-    const seenAttr = new Set();
+  // Walk up from a node to the outermost ancestor that sits OUTSIDE `root` and
+  // is positioned/portaled — i.e. the popover/tooltip container itself, not the
+  // text node inside it. Returns the node unchanged if it's within root.
+  function revealContainer(n, root) {
+    if (!n || n.nodeType !== 1 || (root && root.contains(n))) return n;
+    let best = n, p = n.parentElement;
+    while (p && p !== document.body && p !== document.documentElement && !(root && root.contains(p))) {
+      const pos = getComputedStyle(p).position;
+      if (pos === 'absolute' || pos === 'fixed' || p.matches('[role],[class*="opover"],[class*="ooltip"],[class*="overcard"],[class*="enu"]')) best = p;
+      p = p.parentElement;
+    }
+    return best;
+  }
+
+  function summarizeMutations(mutations, root) {
+    const addedNodes = [], addedEls = [], attrEls = [], attrChanges = [];
+    const seenAttr = new Set(), seenEl = new Set();
+    const pushReveal = (n) => {
+      // Capture the whole revealed container (popover/tooltip), not just the
+      // inner fragment, so an off-selection reveal gives the model real markup.
+      const container = revealContainer(n, root);
+      if (!seenEl.has(container) && anyVisible(container)) {
+        seenEl.add(container);
+        addedEls.push(container);
+        addedNodes.push({ selector: describeEl(container), html: (container.outerHTML || '').slice(0, 2500) });
+      }
+    };
     for (const m of mutations) {
       if (isSelfMutation(m)) continue;
       if (m.type === 'childList') {
         m.addedNodes.forEach((n) => {
-          if (n.nodeType === 1 && !isSelfNode(n) && anyVisible(n)) {
-            addedEls.push(n);
-            addedNodes.push({ selector: describeEl(n), html: (n.outerHTML || '').slice(0, 1500) });
-          }
+          if (n.nodeType === 1 && !isSelfNode(n) && anyVisible(n)) pushReveal(n);
         });
       } else if (m.type === 'attributes') {
         const value = m.target.getAttribute(m.attributeName);
@@ -810,9 +831,16 @@
           seenAttr.add(sig);
           attrChanges.push({ selector: describeEl(m.target), attr: m.attributeName, value });
         }
+        // An attribute flip that makes an OFF-selection element visible (e.g. a
+        // singleton popover toggling display:none→block) is a reveal too — track
+        // its box so the screenshot crop includes it, and grab its HTML.
+        if (m.target.nodeType === 1 && isVisible(m.target)) {
+          if (!attrEls.includes(m.target)) attrEls.push(m.target);
+          if (root && !root.contains(m.target)) pushReveal(m.target);
+        }
       }
     }
-    return { addedNodes, addedEls, attrChanges };
+    return { addedNodes, addedEls, attrEls, attrChanges };
   }
 
   // Visible cursor that animates to each probed element ("watch the agent move").
@@ -833,6 +861,16 @@
     probeCursor.style.transform = `translate(${r.left + r.width / 2}px, ${r.top + r.height / 2}px) translate(-50%,-50%)`;
   }
   function hideCursor() { probeCursor?.remove(); probeCursor = null; }
+
+  // Elements that explicitly advertise a CLICK-driven popup/disclosure — menus,
+  // dropdowns, expanders. Deliberately NARROW (not every button): a click pass
+  // doubles work and each capture is throttled, and plain action buttons
+  // (submit/like) reveal nothing persistent. Only retry these with a click.
+  const CLICKABLE_SEL = '[aria-haspopup],[aria-expanded],[aria-controls],summary,[data-toggle],[data-dropdown],[data-menu],[data-popover-target]';
+  function looksClickable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try { return el.matches(CLICKABLE_SEL); } catch { return false; }
+  }
 
   const INTERACTIVE_SEL = 'button,a,[role="button"],[aria-haspopup],[aria-expanded],[data-tooltip],[data-hovercard-url],[data-hovercard-type],[title],[tabindex],[data-interaction]';
   const NESTED_PARENTS = 2;     // revealed parents expanded one level deeper
@@ -895,7 +933,7 @@
     await waitForSettle(() => mutations.length); // wait out slow async reveals
     obs.disconnect();
 
-    const summary = summarizeMutations(mutations);
+    const summary = summarizeMutations(mutations, root);
     const dpr = window.devicePixelRatio || 1;
     const afterFull = await captureHidingCursor();
 
@@ -916,10 +954,11 @@
     });
     if (!domChanged && !pixelReveal) { undo(); await sleep(PROBE_RESET_MS); return null; }
 
-    // Crop to the union of the DOM box and the changed-pixels box, so an
-    // off-element popover is always inside the screenshot.
-    const domRect = probeUnionRect(root, [...summary.addedEls, el]);
-    const rect = pixelReveal ? unionRects(domRect, changedRect) : domRect;
+    // Crop to the union of: the component, every revealed element (added OR
+    // attribute-flipped, incl. off-selection popovers), AND the changed-pixels
+    // box — so a reveal rendered outside the picked component is never clipped.
+    const domRect = probeUnionRect(root, [...summary.addedEls, ...summary.attrEls, el]);
+    const rect = changedRect ? unionRects(domRect, changedRect) : domRect;
     const screenshot = await cropInPage(afterFull, rect, dpr);
     if (!screenshot) console.warn('[atomic-strip] reveal detected but screenshot crop failed for', describeEl(el), action);
 
@@ -952,7 +991,7 @@
     await waitForSettle(() => mutations.length); // wait out slow async reveals
     obs.disconnect();
 
-    const summary = summarizeMutations(mutations);
+    const summary = summarizeMutations(mutations, root);
     const dpr = window.devicePixelRatio || 1;
     const afterFull = await captureHidingCursor();
 
@@ -963,8 +1002,8 @@
     const pixelReveal = !!changedRect && fractionOutside(changedRect, refRect) > 0.35;
     if (!domChanged && !pixelReveal) { undo(); await sleep(PROBE_RESET_MS); return null; }
 
-    const domRect = probeUnionRect(root, [...summary.addedEls, parentEl, childEl]);
-    const rect = pixelReveal ? unionRects(domRect, changedRect) : domRect;
+    const domRect = probeUnionRect(root, [...summary.addedEls, ...summary.attrEls, parentEl, childEl]);
+    const rect = changedRect ? unionRects(domRect, changedRect) : domRect;
     const screenshot = await cropInPage(afterFull, rect, dpr);
 
     undo();
@@ -1012,12 +1051,18 @@
       const baselineFull = await captureHidingCursor();
       console.debug('[atomic-strip] sweep start', { root: describeEl(root), candidates: candidates.length, baselineFull: !!baselineFull });
 
-      // Top-level pass: probe every interactive part.
+      // Top-level pass: probe every interactive part. Try hover first; if it
+      // reveals nothing and the element looks click-driven (menus/dropdowns that
+      // open on click, not hover), fall back to a click — the most common
+      // dropdown pattern that a hover-only sweep would otherwise miss.
       const expandable = [];
       for (const el of candidates) {
         if (states.length >= MAX_STATES) break;
         try {
-          const state = await probeAction(root, el, 'hover', baselineFull);
+          let state = await probeAction(root, el, 'hover', baselineFull);
+          if (!state && looksClickable(el)) {
+            state = await probeAction(root, el, 'click', baselineFull);
+          }
           // Keep any state where a reveal was detected (probeAction already
           // returned null for true no-ops). A missing screenshot is a capture
           // hiccup — don't throw away the interaction spec along with it.

@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>off-selection reveal probe test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; font: 14px -apple-system, system-ui, sans-serif; }
+  /* The SELECTED component is a small row near the top. */
+  #target { position: relative; margin: 40px; padding: 8px 12px; border: 1px solid #d0d7de; border-radius: 6px;
+            display: flex; gap: 8px; align-items: center; width: 360px; }
+  a { color: #1f2328; text-decoration: none; }
+  a:hover { color: #0969da; }
+
+  /* The hovercard is a PRE-POPULATED singleton, positioned FAR BELOW & RIGHT of
+     the component (portaled to body). Opening = display flip ONLY (no DOM add). */
+  .Popover.js-hovercard-content {
+    position: absolute; display: none; z-index: 100; top: 300px; left: 480px; width: 320px;
+    background: #fff; border: 1px solid #d0d7de; border-radius: 12px; box-shadow: 0 8px 24px rgba(66,74,83,.2); padding: 16px;
+  }
+</style>
+</head>
+<body>
+  <div id="target">
+    <a href="/x" class="trigger" data-hovercard-url="/u/hovercard" aria-keyshortcuts="Alt+ArrowUp">hover me</a>
+    <span>· some commit</span>
+  </div>
+
+  <!-- pre-populated, hidden, far from #target -->
+  <div class="Popover js-hovercard-content" role="region" aria-label="Hovercard" style="display:none;">
+    <strong>Revealed popover OUTSIDE the selected component</strong>
+    <p style="color:#636c76;margin:6px 0 0">If this is in the screenshot, the crop fix works.</p>
+  </div>
+
+  <script src="../vendor/html2canvas.min.js"></script>
+  <script>
+    // Open via Alt+ArrowUp on the focused trigger; opening flips ONLY display
+    // (content is already there) — so the observer sees an ATTRIBUTE change, not
+    // an added node. This is the path that previously clipped the popover.
+    const pop = document.querySelector('.js-hovercard-content');
+    document.addEventListener('keydown', (e) => {
+      if (e.altKey && e.key === 'ArrowUp') {
+        const a = document.activeElement;
+        if (a && a.closest && a.closest('[data-hovercard-url]')) {
+          setTimeout(() => { pop.style.display = 'block'; }, 200);
+        }
+      }
+    });
+  </script>
+  <script>
+    const listeners = [];
+    window.chrome = { runtime: { lastError:null,
+      sendMessage(m, cb){ if (m && m.type==='CAPTURE_VISIBLE'){ html2canvas(document.documentElement,{x:scrollX,y:scrollY,width:innerWidth,height:innerHeight,scale:devicePixelRatio||1,logging:false,backgroundColor:'#fff'}).then(c=>cb&&cb({dataUrl:c.toDataURL('image/png')})).catch(()=>cb&&cb({dataUrl:null})); return; } if(cb)cb({ok:true}); return Promise.resolve({ok:true}); },
+      onMessage:{ addListener(fn){ listeners.push(fn); } } }, scripting:{} };
+    window.__dispatch = (message) => new Promise((resolve) => { let answered=false; const sendResponse=(r)=>{answered=true;resolve(r);}; for(const fn of listeners){ if(fn(message,{},sendResponse)===true) return; } if(!answered) resolve(undefined); });
+  </script>
+  <script src="../content.js"></script>
+  <script>
+    window.runProbeTest = async () => {
+      const t = document.getElementById('target'); const r = t.getBoundingClientRect();
+      const resp = await window.__dispatch({ type:'REPROBE', captureId:'off', selector:'#target', rect:{top:r.top,left:r.left,width:r.width,height:r.height} });
+      return resp;
+    };
+  </script>
+</body>
+</html>
